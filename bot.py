@@ -3,7 +3,7 @@ import time
 import logging
 from dotenv import load_dotenv
 from atproto import Client, models
-from atproto.xrpc_client.models.common import XrpcError
+from atproto.exceptions import XrpcError
 import google.generativeai as genai
 
 # Configure basic logging
