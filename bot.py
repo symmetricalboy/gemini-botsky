@@ -2,7 +2,7 @@ import os
 import time
 import logging
 from dotenv import load_dotenv
-from atproto import Client, DatetimeAwareClient, models
+from atproto import Client, models
 from atproto.xrpc_client.models.common import XrpcError
 import google.generativeai as genai
 
@@ -27,13 +27,13 @@ bsky_client = None
 # Using a file for persistence across restarts would be more robust
 last_processed_mention_ctime = None 
 
-def initialize_bluesky_client() -> DatetimeAwareClient | None:
+def initialize_bluesky_client() -> Client | None:
     """Initializes and logs in the Bluesky client."""
     if not (BLUESKY_HANDLE and BLUESKY_PASSWORD):
         logging.error("Bluesky handle or password not found in environment variables.")
         return None
     
-    client = DatetimeAwareClient()
+    client = Client()
     try:
         profile = client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
         logging.info(f"Successfully logged in to Bluesky as {profile.handle}")
