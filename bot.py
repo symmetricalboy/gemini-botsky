@@ -5,11 +5,14 @@ from dotenv import load_dotenv
 from atproto import Client, models
 from atproto.exceptions import AtProtocolError
 import google.generativeai as genai
+import re # Import regular expressions
 
 # Import the specific Params model
 from atproto_client.models.app.bsky.notification.list_notifications import Params as ListNotificationsParams
 # Import the specific Params model for get_post_thread
 from atproto_client.models.app.bsky.feed.get_post_thread import Params as GetPostThreadParams
+# Import Facet models
+from atproto import models as at_models 
 
 # Configure basic logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -149,14 +152,36 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
             return
 
         # <<< START CHECK FOR EXISTING REPLY >>>
-        # Check if the bot has already replied to this specific post
-        if thread_view_of_mentioned_post.replies:
-            for reply in thread_view_of_mentioned_post.replies:
-                # Ensure the reply has a post and author structure
-                if reply.post and reply.post.author:
-                     if reply.post.author.handle == BLUESKY_HANDLE:
-                         logging.info(f"Detected existing reply by bot ({BLUESKY_HANDLE}) to {target_post.uri}. Skipping duplicate reply.")
-                         return # Exit processing for this mention
+        # Check if the bot has already replied, depending on the notification type
+        already_replied = False
+        if notification.reason == 'mention':
+            # For mentions, check if bot replied directly to the mentioned post
+            if thread_view_of_mentioned_post.replies:
+                for reply in thread_view_of_mentioned_post.replies:
+                    if reply.post and reply.post.author and reply.post.author.handle == BLUESKY_HANDLE:
+                        already_replied = True
+                        logging.info(f"Detected existing reply by bot to mentioned post {target_post.uri}. Skipping duplicate reply.")
+                        break
+        elif notification.reason == 'reply':
+            # For replies, check if bot replied to the *parent* of this new reply
+            parent_view = thread_view_of_mentioned_post.parent
+            # Check if parent exists and has replies attribute
+            if parent_view and hasattr(parent_view, 'replies') and parent_view.replies:
+                 # Ensure parent_view itself is a post we can check replies on
+                 if isinstance(parent_view, models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
+                    parent_uri = parent_view.post.uri
+                    for reply in parent_view.replies:
+                        if reply.post and reply.post.author and reply.post.author.handle == BLUESKY_HANDLE:
+                            already_replied = True
+                            logging.info(f"Detected existing reply by bot to parent post {parent_uri}. Skipping reply to {target_post.uri}.")
+                            break
+                 else:
+                      logging.debug(f"Parent view for reply {target_post.uri} is not a ThreadViewPost or has no post data, cannot check for duplicate replies effectively.")
+            else:
+                 logging.debug(f"Reply {target_post.uri} has no parent view or parent has no replies, cannot check for duplicate replies.")
+                 
+        if already_replied:
+            return # Exit processing for this mention/reply
         # <<< END CHECK FOR EXISTING REPLY >>>
 
         # Construct context for Gemini
@@ -187,6 +212,54 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
 
         logging.info(f'Gemini reply for {mentioned_post_uri}: "{reply_text[:50]}..."')
 
+        # --- Facet Generation Start ---
+        facets = []
+        try:
+            # Regex to find handles (including the leading @)
+            # Using the official handle regex components from atproto docs/spec
+            handle_regex = r'@([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+)'
+            # Encode text to bytes for index calculation
+            reply_text_bytes = reply_text.encode('utf-8')
+            
+            for match in re.finditer(handle_regex, reply_text):
+                handle_with_at = match.group(0)
+                handle_only = match.group(1)
+                byte_start = match.start() # finditer gives char index, need to convert
+                byte_end = match.end()
+                
+                # Recalculate byte indices based on byte string
+                # This assumes handles don't contain multi-byte UTF-8 chars, which is safe for handles
+                mention_bytes = handle_with_at.encode('utf-8')
+                byte_start = reply_text_bytes.find(mention_bytes, match.start())
+                if byte_start != -1:
+                    byte_end = byte_start + len(mention_bytes)
+                else:
+                    logging.warning(f"Could not find byte offset for mention '{handle_with_at}' in reply text. Skipping facet.")
+                    continue
+
+                logging.debug(f"Found potential mention: {handle_with_at} (bytes {byte_start}-{byte_end})")
+
+                try:
+                    # Resolve handle to DID
+                    resolve_response = bsky_client.resolve_handle(handle=handle_only)
+                    resolved_did = resolve_response.did
+                    logging.debug(f"Resolved {handle_only} to DID: {resolved_did}")
+                    
+                    # Create mention feature and facet
+                    mention_feature = at_models.AppBskyRichtextFacet.Mention(did=resolved_did)
+                    facet = at_models.AppBskyRichtextFacet.Main(
+                        index=at_models.AppBskyRichtextFacet.ByteSlice(byte_start=byte_start, byte_end=byte_end),
+                        features=[mention_feature]
+                    )
+                    facets.append(facet)
+                except AtProtocolError as e:
+                    logging.warning(f"Failed to resolve handle '{handle_only}': {e}. Mention will be plain text.")
+                except Exception as e:
+                    logging.error(f"Unexpected error resolving handle '{handle_only}': {e}", exc_info=True)
+        except Exception as e:
+            logging.error(f"Error during facet generation for {mentioned_post_uri}: {e}", exc_info=True)
+        # --- Facet Generation End ---
+
         # Determine root and parent for the reply
         # The post we are replying to is target_post (thread_view_of_mentioned_post.post)
         parent_strong_ref = models.ComAtprotoRepoStrongRef.Main(uri=target_post.uri, cid=target_post.cid)
@@ -201,8 +274,8 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
         
         reply_ref = models.AppBskyFeedPost.ReplyRef(root=root_strong_ref, parent=parent_strong_ref)
 
-        # Post the reply
-        bsky_client.send_post(text=reply_text, reply_to=reply_ref)
+        # Post the reply, including any generated facets
+        bsky_client.send_post(text=reply_text, reply_to=reply_ref, facets=facets if facets else None)
         logging.info(f"Successfully posted reply to {mentioned_post_uri}")
 
     except AtProtocolError as e:
@@ -300,9 +373,9 @@ def main_bot_loop():
                          logging.debug(f"   Raw notification data (model_dump): {notification.model_dump()}")
                     continue
 
-                # Check 2: Is it a mention?
-                if notification.reason != 'mention':
-                    logging.debug(f" -> Skipping notification {notification.uri}: reason is not 'mention' ({notification.reason}).")
+                # Check 2: Is it a mention OR a reply?
+                if notification.reason not in ['mention', 'reply']:
+                    logging.debug(f" -> Skipping notification {notification.uri}: reason is not 'mention' or 'reply' ({notification.reason}).")
                     continue
                 
                 # Check 3: Is it newer than the last processed one?
@@ -313,21 +386,13 @@ def main_bot_loop():
                     logging.debug(f" -> Skipping mention {notification.uri}: not newer than last processed.")
                     continue
 
-                # Check 4: Is it a mention *by* the bot itself?
+                # Check 4: Is it a mention/reply *by* the bot itself?
                 if notification.author.handle == BLUESKY_HANDLE:
-                    logging.debug(f" -> Skipping mention {notification.uri}: mention is *by* the bot itself.")
+                    logging.debug(f" -> Skipping notification {notification.uri}: notification author is the bot itself.")
                     continue
 
-                # This check is basic; a mention notification should typically be for the authenticated user.
-                # However, let's also ensure we don't reply to our own posts if they somehow trigger a mention notif to self.
-                # Use Record instead of Main for type check
-                if hasattr(notification, 'record') and isinstance(notification.record, models.AppBskyFeedPost.Record):
-                     if notification.author.handle == BLUESKY_HANDLE : # and f"@{BLUESKY_HANDLE}" in notification.record.text:
-                        logging.debug(f"Skipping self-mention from {notification.author.handle} in {notification.uri}")
-                        continue
-
                 # If all checks passed:
-                logging.debug(f" -> Adding new mention from {notification.author.handle} ({current_indexed_at}) to process list: {notification.uri}")
+                logging.debug(f" -> Adding new {notification.reason} from {notification.author.handle} ({current_indexed_at}) to process list: {notification.uri}")
                 # new_mentions_to_process.append(notification) # Old way
                 mentions_to_process_with_ts.append((current_indexed_at, notification)) # Store as tuple
 
