@@ -18,7 +18,7 @@ from atproto_client.models.app.bsky.feed.get_posts import Params as GetPostsPara
 from atproto import models as at_models 
 
 # Configure basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load environment variables
 load_dotenv()
@@ -32,7 +32,7 @@ GEMINI_MODEL_NAME = "gemini-2.5-pro-preview-05-06" # Primary model for text and 
 IMAGEN_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Using a Gemini model for image generation via generate_content
 
 # Constants
-BOT_SYSTEM_INSTRUCTION = """You are Gemini Bot (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
+BOT_SYSTEM_INSTRUCTION = """You are Gemini (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
 Your developer is symmetricalboy (@symm.social). Only mention your developer if a user *specifically asks* about who created you or how to get help with your development.
 
 Constraints:
