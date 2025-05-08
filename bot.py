@@ -149,6 +149,9 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             parent_view = thread_view_of_mentioned_post.parent 
             if isinstance(parent_view, at_models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
                 parent_post = parent_view.post
+                # Add debug log to verify parent info
+                logging.info(f"[Reply Check] Notification for {notification.uri}. Parent post identified as: URI={parent_post.uri}, Author={parent_post.author.handle}")
+                
                 # **NEW LOGIC**: If the parent post (the one being replied to) is by the bot, IGNORE the reply entirely.
                 if parent_post.author.handle == BLUESKY_HANDLE:
                     logging.info(f"[IGNORE REPLY] Notification {notification.uri} is a reply to a post made by the bot ({parent_post.uri}). Ignoring.")
