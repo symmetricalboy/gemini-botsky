@@ -403,6 +403,13 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                                 # The data is likely base64-encoded, so we need to convert it to bytes
                                 try:
                                     image_data_bytes = base64.b64decode(part.inline_data.data)
+                                    # Validate image size - real images should be at least a few KB
+                                    if len(image_data_bytes) < 1000:  # Minimum 1KB for a reasonable image
+                                        logging.warning(f"Image data too small ({len(image_data_bytes)} bytes). May be invalid.")
+                                        if len(image_data_bytes) < 100:  # Extremely small images are definitely invalid
+                                            logging.error("Image data too small to be valid. Skipping image.")
+                                            image_data_bytes = None
+                                            continue
                                     logging.info(f"Imagen Attempt {imagen_attempt + 1}: Imagen returned an image of type: {part.inline_data.mime_type}. Decoded bytes len: {len(image_data_bytes)}")
                                     break # Got the image
                                 except Exception as decode_error:
@@ -410,11 +417,34 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                                     # Try using the data directly if decoding fails
                                     image_data_bytes = part.inline_data.data
                                     logging.warning(f"Using raw data without base64 decoding.")
+                    elif imagen_response_obj and hasattr(imagen_response_obj, 'candidates') and imagen_response_obj.candidates:
+                        # Try the candidates structure which appears in some Gemini responses
+                        for candidate in imagen_response_obj.candidates:
+                            if hasattr(candidate, 'content') and candidate.content:
+                                for content_part in candidate.content.parts:
+                                    if hasattr(content_part, 'inline_data') and content_part.inline_data and content_part.inline_data.mime_type.startswith("image/"):
+                                        try:
+                                            image_data_bytes = base64.b64decode(content_part.inline_data.data)
+                                            if len(image_data_bytes) < 1000:  # Minimum 1KB for a reasonable image
+                                                logging.warning(f"Image data too small ({len(image_data_bytes)} bytes). May be invalid.")
+                                                if len(image_data_bytes) < 100:  # Extremely small images are definitely invalid
+                                                    logging.error("Image data too small to be valid. Skipping image.")
+                                                    image_data_bytes = None
+                                                    continue
+                                            logging.info(f"Imagen Attempt {imagen_attempt + 1}: Found image in candidates structure. Type: {content_part.inline_data.mime_type}. Size: {len(image_data_bytes)} bytes")
+                                            break
+                                        except Exception as decode_error:
+                                            logging.error(f"Error decoding base64 image data from candidates: {decode_error}")
+                                            continue
                     elif imagen_response_obj and hasattr(imagen_response_obj, 'blob'): # Another possible way image data might be returned
                         # This is speculative based on common patterns, adjust if API is different
                         image_data_bytes = imagen_response_obj.blob 
                         logging.info(f"Imagen Attempt {imagen_attempt + 1}: Imagen returned image blob directly.")
                     
+                    # Log the full response structure to help diagnose image extraction issues
+                    if not image_data_bytes:
+                        logging.warning(f"Imagen Attempt {imagen_attempt + 1}: Failed to extract image data. Response structure: {str(imagen_response_obj)[:500]}...")
+
                     if image_data_bytes:
                         generated_alt_text = image_prompt_for_imagen # Use the Imagen prompt as alt text by default
                         logging.info(f"Imagen Attempt {imagen_attempt + 1}: Successfully generated image using Imagen.")
@@ -499,25 +529,40 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         embed_to_post = None
         if image_data_bytes and bsky_client: # Ensure client is available
             try:
-                logging.info("Uploading generated image to Bluesky...")
-                # Make sure we're working with raw bytes for upload_blob
-                # If image_data_bytes is already bytes, use it directly
-                # If it's base64 string, decode it first
-                if isinstance(image_data_bytes, str):
-                    try:
-                        image_data_bytes = base64.b64decode(image_data_bytes)
-                        logging.info(f"Converted base64 string to bytes for upload. Length: {len(image_data_bytes)}")
-                    except Exception as e:
-                        logging.error(f"Error converting base64 string to bytes: {e}")
-                
-                response = bsky_client.com.atproto.repo.upload_blob(image_data_bytes)
-                
-                if response and hasattr(response, 'blob') and response.blob:
-                    logging.info(f"Image uploaded successfully. Blob CID: {response.blob.cid}")
-                    image_for_embed = at_models.AppBskyEmbedImages.Image(alt=generated_alt_text, image=response.blob)
-                    embed_to_post = at_models.AppBskyEmbedImages.Main(images=[image_for_embed])
+                # Skip extremely small images that are likely invalid
+                if len(image_data_bytes) < 500:
+                    logging.warning(f"Image data too small to be valid ({len(image_data_bytes)} bytes). Skipping image upload.")
                 else:
-                    logging.error("Failed to upload image or blob data missing in response.")
+                    logging.info(f"Uploading generated image to Bluesky... Size: {len(image_data_bytes)} bytes")
+                    # Make sure we're working with raw bytes for upload_blob
+                    # If image_data_bytes is already bytes, use it directly
+                    # If it's base64 string, decode it first
+                    if isinstance(image_data_bytes, str):
+                        try:
+                            image_data_bytes = base64.b64decode(image_data_bytes)
+                            logging.info(f"Converted base64 string to bytes for upload. Length: {len(image_data_bytes)}")
+                        except Exception as e:
+                            logging.error(f"Error converting base64 string to bytes: {e}")
+                    
+                    response = bsky_client.com.atproto.repo.upload_blob(image_data_bytes)
+                    
+                    if response and hasattr(response, 'blob') and response.blob:
+                        logging.info(f"Image uploaded successfully. Blob CID: {response.blob.cid}")
+                        # Include more detailed logging of the blob object
+                        if hasattr(response.blob, 'cid'):
+                            logging.info(f"Blob CID: {response.blob.cid}")
+                        if hasattr(response.blob, 'mimeType'):
+                            logging.info(f"Blob MIME type: {response.blob.mimeType}")
+                        
+                        # Ensure alt text isn't too long (Bluesky may have limits)
+                        if len(generated_alt_text) > 300:
+                            generated_alt_text = generated_alt_text[:297] + "..."
+                            logging.info(f"Truncated alt text to 300 chars: {generated_alt_text}")
+                        
+                        image_for_embed = at_models.AppBskyEmbedImages.Image(alt=generated_alt_text, image=response.blob)
+                        embed_to_post = at_models.AppBskyEmbedImages.Main(images=[image_for_embed])
+                    else:
+                        logging.error("Failed to upload image or blob data missing in response.")
             except Exception as e:
                 logging.error(f"Error uploading image to Bluesky: {e}", exc_info=True)
 
