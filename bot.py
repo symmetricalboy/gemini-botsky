@@ -132,7 +132,7 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
     return "\n\n".join(history)
 
 def process_mention(notification: at_models.AppBskyNotificationListNotifications.Notification, gemini_model: genai.GenerativeModel):
-    """Processes a single mention notification."""
+    """Processes a single mention/reply notification."""
     global bsky_client
     if not bsky_client:
         logging.error("Bluesky client not initialized. Cannot process mention.")
@@ -156,53 +156,49 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             logging.warning(f"Thread view for {mentioned_post_uri} does not contain a post.")
             return
             
-        # --- Start: Checks for skipping (Direct Reply / Duplicate) ---
-        already_replied = False 
-        if notification.reason == 'reply':
-            parent_view = thread_view_of_mentioned_post.parent
-            if isinstance(parent_view, at_models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
-                parent_post = parent_view.post
-                if parent_post.author.handle != BLUESKY_HANDLE:
-                    logging.info(f"Skipping reply notification {notification.uri}: Parent post {parent_post.uri} not authored by bot ({BLUESKY_HANDLE}).")
-                    return 
-                
-                # Parent is by bot, check for duplicates
-                logging.debug(f"Reply {notification.uri} is to a bot post {parent_post.uri}. Checking for duplicates.")
-                parent_uri = parent_post.uri
-                try:
-                    parent_params = GetPostThreadParams(uri=parent_uri, depth=1)
-                    parent_thread_response = bsky_client.app.bsky.feed.get_post_thread(params=parent_params)
-                    if isinstance(parent_thread_response.thread, at_models.AppBskyFeedDefs.ThreadViewPost) and parent_thread_response.thread.replies:
-                        for reply_to_parent in parent_thread_response.thread.replies:
-                            if reply_to_parent.post and reply_to_parent.post.author and reply_to_parent.post.author.handle == BLUESKY_HANDLE:
-                                already_replied = True
-                                logging.info(f"Detected existing reply by bot ({BLUESKY_HANDLE}) to parent post {parent_uri}. Skipping reply to {target_post.uri}.")
-                                break 
-                    else:
-                        logging.debug(f"Parent post {parent_uri} has no replies according to its thread view.")
-                except AtProtocolError as e:
-                    logging.error(f"Failed to fetch parent thread {parent_uri} to check for duplicates: {e}")
-                    already_replied = True 
-                    logging.warning(f"Skipping reply to {target_post.uri} due to error checking parent.")
-                except Exception as e:
-                    logging.error(f"Unexpected error fetching parent thread {parent_uri}: {e}", exc_info=True)
-                    already_replied = True 
-                    logging.warning(f"Skipping reply to {target_post.uri} due to error checking parent.")
-            else:
-                logging.warning(f"Could not identify parent post for reply notification {notification.uri}. Skipping reply for safety." )
-                already_replied = True 
+        # --- Start: Checks for skipping --- 
 
-        elif notification.reason == 'mention':
-            if thread_view_of_mentioned_post.replies:
-                for reply in thread_view_of_mentioned_post.replies:
-                    if reply.post and reply.post.author and reply.post.author.handle == BLUESKY_HANDLE:
-                        already_replied = True
-                        logging.info(f"Detected existing reply by bot to mentioned post {target_post.uri}. Skipping duplicate reply.")
-                        break
-                        
-        if already_replied:
-            return 
-        # --- End: Checks for skipping ---
+        # Check 1: If it's a 'reply' notification, ensure it's a direct reply TO THE BOT.
+        if notification.reason == 'reply':
+            parent_view = thread_view_of_mentioned_post.parent # The parent of the post that triggered the notification
+            # The post that triggered the notification IS target_post. Its parent should be by the bot.
+            if isinstance(parent_view, at_models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
+                parent_of_triggering_post = parent_view.post # This is the post the user actually replied to.
+                if parent_of_triggering_post.author.handle != BLUESKY_HANDLE:
+                    logging.info(f"Skipping reply notification {notification.uri}: The replied-to post ({parent_of_triggering_post.uri}) was not authored by bot ({BLUESKY_HANDLE}).")
+                    return 
+            else: 
+                # If we can't identify the parent post of the triggering reply, it's ambiguous.
+                # This could happen if the reply is to a very old/deleted post or structure is odd.
+                logging.warning(f"Could not identify parent of triggering reply {notification.uri}. Skipping for safety.")
+                return
+
+        # Check 2: Has the bot ALREADY replied directly to the TARGET_POST?
+        # For 'mention', target_post is the post containing the mention.
+        # For 'reply', target_post is the new reply itself. We need to check replies to *its parent* (which we confirmed above is the bot's post).
+        
+        post_to_check_for_bot_replies = None
+        if notification.reason == 'mention':
+            post_to_check_for_bot_replies = thread_view_of_mentioned_post # Check replies to the post containing the mention
+        elif notification.reason == 'reply':
+            # We already verified the parent of target_post is by the bot.
+            # So, we need to see the thread of that parent to check its replies.
+            if isinstance(thread_view_of_mentioned_post.parent, at_models.AppBskyFeedDefs.ThreadViewPost):
+                 post_to_check_for_bot_replies = thread_view_of_mentioned_post.parent
+            # else: this case should have been caught by the parent check above for replies.
+
+        if post_to_check_for_bot_replies and post_to_check_for_bot_replies.replies:
+            for reply_in_thread in post_to_check_for_bot_replies.replies:
+                if reply_in_thread.post and reply_in_thread.post.author and reply_in_thread.post.author.handle == BLUESKY_HANDLE:
+                    # If the reply is to the bot's own post (notification.reason == 'reply'),
+                    # we need to ensure this bot reply isn't the trigger_post itself if multiple replies came in fast.
+                    if notification.reason == 'reply' and reply_in_thread.post.uri == target_post.uri:
+                        continue # This is the triggering reply itself, not a pre-existing duplicate by the bot.
+                    
+                    logging.info(f"Detected existing reply by bot under {post_to_check_for_bot_replies.post.uri if post_to_check_for_bot_replies.post else 'target context'}. Skipping notification {notification.uri}.")
+                    return
+        
+        # --- End: Checks for skipping --- 
 
         # Construct context for Gemini
         context_string = format_thread_for_gemini(thread_view_of_mentioned_post, BLUESKY_HANDLE)
@@ -296,7 +292,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         try:
             # --- Step 1: Mentions ---
             # Regex to find handles (including the leading @)
-            handle_regex = r'@((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.){1,}[a-zA-Z]{2,})\''
+            handle_regex = r'@((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.){1,}[a-zA-Z]{2,})'
             reply_text_bytes = reply_text.encode('utf-8')
             used_byte_ranges = [] # Keep track of used ranges to prevent overlaps
 
@@ -339,8 +335,8 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
 
             # --- Step 2: Links ---
             # Simple regex for http/https URLs
-            # Note: More complex regex needed for broader URL patterns, but keep it simple for now.
-            link_regex = r'https?://[\\S]+' 
+            # Updated regex: \S+ instead of [\S]+
+            link_regex = r'https?://\S+' 
             for match in re.finditer(link_regex, reply_text):
                 url = match.group(0)
                 
@@ -378,7 +374,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
 
             # --- Step 3: Hashtags ---
             # Regex for hashtags (simple version: # followed by word characters)
-            tag_regex = r'#([\\w]+)'
+            tag_regex = r'#(\w+)' # This regex was okay
             for match in re.finditer(tag_regex, reply_text):
                 tag_with_hash = match.group(0)
                 tag_only = match.group(1)
