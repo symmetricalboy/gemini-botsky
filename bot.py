@@ -122,7 +122,16 @@ def initialize_imagen_model() -> genai.GenerativeModel | None:
         # Typically, image generation models don't use 'system_instruction' or the same 'safety_settings' structure.
         # They might have parameters like 'number_of_images', 'output_format', etc.
         # For `imagen-3.0-generate-002`, the API might be simpler, focusing on the prompt.
-        model = genai.GenerativeModel(IMAGEN_MODEL_NAME)
+        imagen_model_kwargs = {
+            "model_name": IMAGEN_MODEL_NAME,
+            "safety_settings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+        }
+        model = genai.GenerativeModel(**imagen_model_kwargs)
         logging.info(f"Successfully initialized Imagen model with: {IMAGEN_MODEL_NAME}")
         return model
     except Exception as e:
@@ -375,11 +384,9 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 try:
                     logging.info(f"Sending prompt to Imagen model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
                     
-                    # Explicitly request an image response from the Imagen model.
-                    imagen_response_obj = imagen_model.generate_content(
-                        image_prompt_for_imagen,
-                        generation_config=genai.types.GenerationConfig(response_mime_type="image/png") # Specify image output
-                    )
+                    # The model infers image generation from the prompt and its capabilities.
+                    # We don't need/can't use response_mime_type for image generation here.
+                    imagen_response_obj = imagen_model.generate_content(image_prompt_for_imagen)
                     
                     # Try to extract image bytes - this is an assumption on response structure
                     # It's common for image models to return parts, or a direct image attribute.
