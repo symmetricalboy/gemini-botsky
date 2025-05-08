@@ -384,13 +384,14 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 try:
                     logging.info(f"Sending prompt to Imagen model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
                     
-                    # For Gemini 2.0 image generation models, we need to specifically request both TEXT and IMAGE modalities
+                    # For Gemini image generation models, we need to specifically use the right configuration
+                    # Using the response_modalities approach from the official docs
                     imagen_response_obj = imagen_model.generate_content(
                         image_prompt_for_imagen,
-                        generation_config=genai.types.GenerationConfig(
-                            # Explicitly request both TEXT and IMAGE in the response - this is what the error says the model needs
-                            response_modalities=["TEXT", "IMAGE"]
-                        )
+                        # Making sure to use types.GenerateContentConfig correctly
+                        generation_config={
+                            "response_modalities": ["TEXT", "IMAGE"]
+                        }
                     )
                     
                     # Try to extract image bytes - this is an assumption on response structure
