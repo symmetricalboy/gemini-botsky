@@ -151,6 +151,24 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
             logging.warning(f"Thread view for {mentioned_post_uri} does not contain a post.")
             return
 
+        # <<< START NEW CHECK: Is the reply *directly* to the bot? >>>
+        if notification.reason == 'reply':
+            parent_view = thread_view_of_mentioned_post.parent
+            # Check if parent exists and is a valid post view
+            if isinstance(parent_view, models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
+                 # Check if the PARENT post author is the bot
+                 if parent_view.post.author.handle != BLUESKY_HANDLE:
+                     logging.info(f"Skipping reply notification {notification.uri}: Parent post {parent_view.post.uri} not authored by bot ({BLUESKY_HANDLE}).")
+                     return # Exit processing, not a direct reply to the bot
+                 else:
+                     logging.debug(f"Reply notification {notification.uri} is confirmed to be a reply to bot's post {parent_view.post.uri}.")
+            else:
+                 # If we can't determine the parent, log it but cautiously proceed? 
+                 # Or skip? Let's skip for now to be safe and avoid over-replying.
+                 logging.warning(f"Could not determine parent author for reply notification {notification.uri}. Skipping.")
+                 return
+        # <<< END NEW CHECK >>>
+
         # <<< START CHECK FOR EXISTING REPLY >>>
         # Check if the bot has already replied, depending on the notification type
         already_replied = False
