@@ -201,6 +201,7 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
 
         # <<< START CHECK FOR EXISTING REPLY (Now combined with above logic) >>>
         # Check if the bot has already replied, depending on the notification type
+        already_replied = False # Initialize default value
         # The already_replied flag is set above for the 'reply' case if needed
         # Only need to explicitly check for the 'mention' case here
         if notification.reason == 'mention':
