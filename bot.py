@@ -223,8 +223,23 @@ def main_bot_loop():
             params = ListNotificationsParams(limit=25)
             notifications_response = bsky_client.app.bsky.notification.list_notifications(params=params)
             
+            # <<< START NEW DEBUG LOGGING >>>
+            logging.debug(f"Type of notifications_response: {type(notifications_response)}")
+            if notifications_response:
+                logging.debug(f"Notifications response object: {notifications_response}") # Log the whole object (might be verbose)
+                logging.debug(f"Does response have 'notifications' attribute? {hasattr(notifications_response, 'notifications')}")
+                if hasattr(notifications_response, 'notifications'):
+                    logging.debug(f"Value of notifications attribute: {notifications_response.notifications}")
+                    logging.debug(f"Type of notifications attribute: {type(notifications_response.notifications)}")
+                    logging.debug(f"Is notifications attribute None? {notifications_response.notifications is None}")
+                    if isinstance(notifications_response.notifications, list):
+                         logging.debug(f"Length of notifications list: {len(notifications_response.notifications)}")
+            else:
+                 logging.debug("Notifications response object is None or evaluates to False.")
+            # <<< END NEW DEBUG LOGGING >>>
+
             if not notifications_response or not notifications_response.notifications:
-                logging.debug("No new notifications found.")
+                logging.debug("No new notifications found (or response/notifications attribute was empty/None).") # Updated log message
                 time.sleep(MENTION_CHECK_INTERVAL_SECONDS)
                 continue
 
