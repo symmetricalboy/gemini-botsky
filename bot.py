@@ -28,8 +28,8 @@ BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
-GEMINI_MODEL_NAME = "gemini-2.5-pro-preview-05-06" # Changed to the new primary model
-IMAGEN_MODEL_NAME = "imagen-3.0-generate-002" # New model for image generation
+GEMINI_MODEL_NAME = "gemini-2.5-pro-preview-05-06" # Primary model for text and system instructions
+IMAGEN_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Using a Gemini model for image generation via generate_content
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = """You are Gemini Bot (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
