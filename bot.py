@@ -23,8 +23,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = "You are a helpful assistant on the Bluesky social network. Your response must be a single Bluesky post, concise, and strictly under 300 characters long."
-MENTION_CHECK_INTERVAL_SECONDS = 60 # Check for new mentions every 60 seconds
+MENTION_CHECK_INTERVAL_SECONDS = 15 # Check for new mentions every 15 seconds (was 60)
 MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # How many parent posts to fetch for context
+NOTIFICATION_FETCH_LIMIT = 100 # How many notifications to fetch (was 25)
 
 # Global variable to store the client, to be initialized in main()
 bsky_client = None 
@@ -147,6 +148,17 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
             logging.warning(f"Thread view for {mentioned_post_uri} does not contain a post.")
             return
 
+        # <<< START CHECK FOR EXISTING REPLY >>>
+        # Check if the bot has already replied to this specific post
+        if thread_view_of_mentioned_post.replies:
+            for reply in thread_view_of_mentioned_post.replies:
+                # Ensure the reply has a post and author structure
+                if reply.post and reply.post.author:
+                     if reply.post.author.handle == BLUESKY_HANDLE:
+                         logging.info(f"Detected existing reply by bot ({BLUESKY_HANDLE}) to {target_post.uri}. Skipping duplicate reply.")
+                         return # Exit processing for this mention
+        # <<< END CHECK FOR EXISTING REPLY >>>
+
         # Construct context for Gemini
         # Pass BLUESKY_HANDLE to potentially filter bot's own messages if desired in the future
         context_string = format_thread_for_gemini(thread_view_of_mentioned_post, BLUESKY_HANDLE)
@@ -225,8 +237,8 @@ def main_bot_loop():
             # not for filtering. We need to filter by notification.indexedAt (ctime) ourselves.
             # notifications_response = bsky_client.app.bsky.notification.list_notifications(limit=25) # Fetch recent 25
             
-            # Try explicit Params object
-            params = ListNotificationsParams(limit=25)
+            # Use explicit Params object with updated limit
+            params = ListNotificationsParams(limit=NOTIFICATION_FETCH_LIMIT)
             notifications_response = bsky_client.app.bsky.notification.list_notifications(params=params)
             
             # <<< START NEW DEBUG LOGGING >>>
