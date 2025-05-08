@@ -156,17 +156,36 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
             parent_view = thread_view_of_mentioned_post.parent
             # Check if parent exists and is a valid post view
             if isinstance(parent_view, models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
-                 # Check if the PARENT post author is the bot
-                 if parent_view.post.author.handle != BLUESKY_HANDLE:
-                     logging.info(f"Skipping reply notification {notification.uri}: Parent post {parent_view.post.uri} not authored by bot ({BLUESKY_HANDLE}).")
-                     return # Exit processing, not a direct reply to the bot
-                 else:
-                     logging.debug(f"Reply notification {notification.uri} is confirmed to be a reply to bot's post {parent_view.post.uri}.")
+                parent_uri = parent_view.post.uri
+                logging.debug(f"Checking for duplicate reply to parent post: {parent_uri}")
+                try:
+                    # Fetch the parent thread specifically to check its replies accurately
+                    parent_params = GetPostThreadParams(uri=parent_uri, depth=1) # Depth 1 is sufficient
+                    parent_thread_response = bsky_client.app.bsky.feed.get_post_thread(params=parent_params)
+                    
+                    if isinstance(parent_thread_response.thread, models.AppBskyFeedDefs.ThreadViewPost) and parent_thread_response.thread.replies:
+                        for reply_to_parent in parent_thread_response.thread.replies:
+                            if reply_to_parent.post and reply_to_parent.post.author and reply_to_parent.post.author.handle == BLUESKY_HANDLE:
+                                already_replied = True
+                                logging.info(f"Detected existing reply by bot ({BLUESKY_HANDLE}) to parent post {parent_uri}. Skipping reply to {target_post.uri}.")
+                                break # Found duplicate
+                    else:
+                        logging.debug(f"Parent post {parent_uri} has no replies according to its thread view.")
+                        
+                except AtProtocolError as e:
+                    logging.error(f"Failed to fetch parent thread {parent_uri} to check for duplicates: {e}")
+                    # Decide whether to proceed cautiously or skip? Skipping is safer for now.
+                    already_replied = True # Treat as duplicate if check failed
+                    logging.warning(f"Skipping reply to {target_post.uri} due to error checking parent.")
+                except Exception as e:
+                    logging.error(f"Unexpected error fetching parent thread {parent_uri}: {e}", exc_info=True)
+                    already_replied = True # Treat as duplicate if check failed
+                    logging.warning(f"Skipping reply to {target_post.uri} due to error checking parent.")
+                    
             else:
-                 # If we can't determine the parent, log it but cautiously proceed? 
-                 # Or skip? Let's skip for now to be safe and avoid over-replying.
-                 logging.warning(f"Could not determine parent author for reply notification {notification.uri}. Skipping.")
-                 return
+                 # If we can't identify the parent post from the initial thread view
+                 logging.warning(f"Could not identify parent post for reply notification {notification.uri}. Skipping duplicate check (and reply for safety)." )
+                 already_replied = True # Skip if parent structure is unclear
         # <<< END NEW CHECK >>>
 
         # <<< START CHECK FOR EXISTING REPLY >>>
@@ -235,7 +254,10 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
         try:
             # Regex to find handles (including the leading @)
             # Using the official handle regex components from atproto docs/spec
-            handle_regex = r'@([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+)'
+            # handle_regex = r'@([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+)' # Old regex - incorrect for multi-part TLDs
+            # Revised regex to better capture full domain handles
+            handle_regex = r'@((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.){1,}[a-zA-Z]{2,})'
+            
             # Encode text to bytes for index calculation
             reply_text_bytes = reply_text.encode('utf-8')
             
