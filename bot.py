@@ -27,7 +27,7 @@ BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
-GEMINI_MODEL_NAME = "gemini-2.5-pro" # Current attempt, may need to change based on ListModels output
+GEMINI_MODEL_NAME = "models/gemini-1.5-pro-latest" # Changed based on ListModels output
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = "You are a helpful assistant on the Bluesky social network. Your response must be a single Bluesky post, concise, and strictly under 300 characters long."
@@ -68,20 +68,12 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
 
-        # --- TEMPORARY: List available models --- 
-        logging.info("--- Listing Available Gemini Models (for v1beta API) ---")
-        for m in genai.list_models():
-            # Check if 'generateContent' is a supported method for this model
-            if (hasattr(m, 'supported_generation_methods') and 
-                isinstance(m.supported_generation_methods, list) and 
-                'generateContent' in m.supported_generation_methods):
-                logging.info(f"Model: {m.name} (Supports 'generateContent')")
-                # logging.info(f"  Description: {m.description}") 
-                # logging.info(f"  Supported Methods: {m.supported_generation_methods}")
-            else:
-                logging.debug(f"Model: {m.name} (Does NOT support 'generateContent' or info unavailable)") 
-        logging.info("--- Finished Listing Available Models ---")
-        # --- END TEMPORARY --- 
+        # --- REMOVING TEMPORARY MODEL LISTING --- 
+        # logging.info("--- Listing Available Gemini Models (for v1beta API) ---")
+        # for m in genai.list_models():
+        #    ...
+        # logging.info("--- Finished Listing Available Models ---")
+        # --- END REMOVAL --- 
 
         model = genai.GenerativeModel(
             model_name=GEMINI_MODEL_NAME, 
@@ -93,10 +85,10 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
             ]
         )
-        logging.info(f"Attempting to initialize Gemini model with: {GEMINI_MODEL_NAME}")
+        logging.info(f"Successfully initialized Gemini model with: {GEMINI_MODEL_NAME}") # Updated log message
         return model
     except Exception as e:
-        logging.error(f"Failed to initialize Gemini model or list models: {e}", exc_info=True)
+        logging.error(f"Failed to initialize Gemini model: {e}", exc_info=True) # Simplified error message
         return None
 
 def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost, own_handle: str) -> str | None:
@@ -159,7 +151,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             return
 
         thread_view_of_mentioned_post = thread_view_response.thread
-        target_post = thread_view_of_mentioned_post.post 
+        target_post = thread_view_of_mentioned_post.post
         if not target_post:
             logging.warning(f"Thread view for {mentioned_post_uri} does not contain a post.")
             return
@@ -247,11 +239,11 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
 
             # Extract text part first
             try:
-                 reply_text = gemini_response.text
+            reply_text = gemini_response.text
             except ValueError as ve: 
                  logging.error(f"Gemini text generation failed for {mentioned_post_uri} (ValueError): {ve}")
-                 if hasattr(gemini_response, 'prompt_feedback') and gemini_response.prompt_feedback.block_reason:
-                     logging.error(f"Gemini prompt blocked. Reason: {gemini_response.prompt_feedback.block_reason}")
+            if hasattr(gemini_response, 'prompt_feedback') and gemini_response.prompt_feedback.block_reason:
+                logging.error(f"Gemini prompt blocked. Reason: {gemini_response.prompt_feedback.block_reason}")
                  # Proceed only if we might get an image
                  reply_text = "" # Allow empty text if image might exist
             
@@ -276,7 +268,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         # Check if we got *anything* back
         if not reply_text and not image_data_bytes:
              logging.info(f"Gemini returned no usable text or image for {mentioned_post_uri}. Skipping reply.")
-             return
+            return
 
         logging.info(f'Gemini reply text for {mentioned_post_uri}: "{reply_text[:50]}..."')
         if image_data_bytes:
@@ -448,7 +440,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 facets=facets if facets else None,
                 embed=embed_to_send # Add the embed here
             )
-            logging.info(f"Successfully posted reply to {mentioned_post_uri}")
+        logging.info(f"Successfully posted reply to {mentioned_post_uri}")
         except AtProtocolError as e:
              logging.error(f"Bluesky API error sending post reply to {mentioned_post_uri}: {e}")
         except Exception as e:
@@ -504,7 +496,7 @@ def main_bot_loop():
             else:
                  logging.debug("Notifications response object is None or evaluates to False.")
             # <<< END NEW DEBUG LOGGING >>>
-
+            
             if not notifications_response or not notifications_response.notifications:
                 logging.debug("No new notifications found (or response/notifications attribute was empty/None).") # Updated log message
                 time.sleep(MENTION_CHECK_INTERVAL_SECONDS)
@@ -552,8 +544,8 @@ def main_bot_loop():
                 # Check 2: Is it a mention OR a reply?
                 if notification.reason not in ['mention', 'reply']:
                     logging.debug(f" -> Skipping notification {notification.uri}: reason is not 'mention' or 'reply' ({notification.reason}).")
-                    continue
-                
+                            continue
+
                 # Check 3: Is it newer than the last processed one?
                 current_indexed_at = indexed_at_value # Use the found value
                 is_new = last_processed_mention_ctime is None or current_indexed_at > last_processed_mention_ctime
