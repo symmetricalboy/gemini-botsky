@@ -7,6 +7,7 @@ from atproto.exceptions import AtProtocolError
 import google.generativeai as genai
 import re # Import regular expressions
 from io import BytesIO # Need BytesIO if Gemini returns image bytes
+import base64
 
 # Import the specific Params model
 from atproto_client.models.app.bsky.notification.list_notifications import Params as ListNotificationsParams
@@ -399,9 +400,16 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                     if imagen_response_obj and hasattr(imagen_response_obj, 'parts') and imagen_response_obj.parts:
                         for part in imagen_response_obj.parts:
                             if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                                image_data_bytes = part.inline_data.data
-                                logging.info(f"Imagen Attempt {imagen_attempt + 1}: Imagen returned an image of type: {part.inline_data.mime_type}")
-                                break # Got the image
+                                # The data is likely base64-encoded, so we need to convert it to bytes
+                                try:
+                                    image_data_bytes = base64.b64decode(part.inline_data.data)
+                                    logging.info(f"Imagen Attempt {imagen_attempt + 1}: Imagen returned an image of type: {part.inline_data.mime_type}. Decoded bytes len: {len(image_data_bytes)}")
+                                    break # Got the image
+                                except Exception as decode_error:
+                                    logging.error(f"Error decoding base64 image data: {decode_error}")
+                                    # Try using the data directly if decoding fails
+                                    image_data_bytes = part.inline_data.data
+                                    logging.warning(f"Using raw data without base64 decoding.")
                     elif imagen_response_obj and hasattr(imagen_response_obj, 'blob'): # Another possible way image data might be returned
                         # This is speculative based on common patterns, adjust if API is different
                         image_data_bytes = imagen_response_obj.blob 
@@ -492,10 +500,17 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         if image_data_bytes and bsky_client: # Ensure client is available
             try:
                 logging.info("Uploading generated image to Bluesky...")
-                # Convert raw bytes to BytesIO if needed by upload_blob
-                # Some SDKs might take raw bytes directly, others might need a file-like object.
-                # The atproto SDK's upload_blob expects bytes directly.
-                response = bsky_client.com.atproto.repo.upload_blob(image_data_bytes) # Correct method call
+                # Make sure we're working with raw bytes for upload_blob
+                # If image_data_bytes is already bytes, use it directly
+                # If it's base64 string, decode it first
+                if isinstance(image_data_bytes, str):
+                    try:
+                        image_data_bytes = base64.b64decode(image_data_bytes)
+                        logging.info(f"Converted base64 string to bytes for upload. Length: {len(image_data_bytes)}")
+                    except Exception as e:
+                        logging.error(f"Error converting base64 string to bytes: {e}")
+                
+                response = bsky_client.com.atproto.repo.upload_blob(image_data_bytes)
                 
                 if response and hasattr(response, 'blob') and response.blob:
                     logging.info(f"Image uploaded successfully. Blob CID: {response.blob.cid}")
