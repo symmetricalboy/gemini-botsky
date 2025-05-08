@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 from atproto import Client, models
 from atproto.exceptions import AtProtocolError
 import google.generativeai as genai
+from google import genai as genai_client
+from google.genai import types
 import re # Import regular expressions
 from io import BytesIO # Need BytesIO if Gemini returns image bytes
 import base64
@@ -30,7 +32,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
 GEMINI_MODEL_NAME = "gemini-2.5-pro-preview-05-06" # Primary model for text and system instructions
-IMAGEN_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Using a Gemini model for image generation via generate_content
+IMAGEN_MODEL_NAME = "imagen-3.0-generate-001" # Updated to use Imagen 3 model
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = """You are Gemini (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
@@ -58,7 +60,7 @@ GEMINI_RETRY_DELAY_SECONDS = 5 # Delay between retries
 # Global variables
 bsky_client: Client | None = None
 gemini_model: genai.GenerativeModel | None = None
-imagen_model: genai.GenerativeModel | None = None # Added for Imagen
+imagen_client = None # Client for Imagen API
 processed_uris_this_run: set[str] = set() # Track URIs processed in this run to handle is_read lag
 
 def initialize_bluesky_client() -> Client | None:
@@ -108,36 +110,23 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
         logging.error(f"Failed to initialize Gemini model: {e}", exc_info=True)
         return None
 
-def initialize_imagen_model() -> genai.GenerativeModel | None:
-    """Initializes the Imagen generative model for image generation."""
-    if not GEMINI_API_KEY: # Assuming Imagen uses the same API key
+def initialize_imagen_model() -> bool:
+    """Initializes the Imagen client for image generation."""
+    global imagen_client
+    
+    if not GEMINI_API_KEY:
         logging.error("Gemini API key (for Imagen) not found in environment variables.")
-        return None
+        return False
     
     try:
-        # genai.configure might already be called, but it's idempotent
-        genai.configure(api_key=GEMINI_API_KEY)
+        # Create a client for the Imagen API
+        imagen_client = genai_client.Client(api_key=GEMINI_API_KEY)
         
-        # Imagen models might have different initialization parameters.
-        # For now, using a basic setup. Refer to specific Imagen documentation if issues arise.
-        # Typically, image generation models don't use 'system_instruction' or the same 'safety_settings' structure.
-        # They might have parameters like 'number_of_images', 'output_format', etc.
-        # For `imagen-3.0-generate-002`, the API might be simpler, focusing on the prompt.
-        imagen_model_kwargs = {
-            "model_name": IMAGEN_MODEL_NAME,
-            "safety_settings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ]
-        }
-        model = genai.GenerativeModel(**imagen_model_kwargs)
-        logging.info(f"Successfully initialized Imagen model with: {IMAGEN_MODEL_NAME}")
-        return model
+        logging.info(f"Successfully initialized Imagen 3 client for model: {IMAGEN_MODEL_NAME}")
+        return True
     except Exception as e:
-        logging.error(f"Failed to initialize Imagen model: {e}", exc_info=True)
-        return None
+        logging.error(f"Failed to initialize Imagen client: {e}", exc_info=True)
+        return False
 
 def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost, own_handle: str) -> str | None:
     """
@@ -388,79 +377,36 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             return
 
         # --- Image Generation with Imagen, if requested by primary model ---
-        if image_prompt_for_imagen and imagen_model: # Check if imagen_model is initialized
+        if image_prompt_for_imagen and imagen_client: # Check if imagen_client is initialized
             for imagen_attempt in range(MAX_GEMINI_RETRIES): # Use same retry constants for now
                 try:
                     logging.info(f"Sending prompt to Imagen model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
                     
-                    # Gemini expects a properly formatted Content object for image generation
-                    # Following the official documentation format
-                    imagen_response_obj = imagen_model.generate_content(
-                        contents=[
-                            {
-                                "role": "user",
-                                "parts": [{"text": image_prompt_for_imagen}]
-                            }
-                        ],
-                        generation_config={
-                            "temperature": 0.4,
-                            "response_modalities": ["TEXT", "IMAGE"]
-                        }
+                    # Use the generate_images method from the Imagen client
+                    imagen_response = imagen_client.models.generate_images(
+                        model=IMAGEN_MODEL_NAME,
+                        prompt=image_prompt_for_imagen,
+                        config=types.GenerateImagesConfig(
+                            number_of_images=1,
+                            aspect_ratio="1:1",  # Square format for Bluesky
+                            safety_filter_level="BLOCK_MEDIUM_AND_ABOVE",
+                            person_generation="ALLOW_ADULT",
+                        )
                     )
                     
-                    # Detailed logging of the response structure to help debug
-                    logging.info(f"Imagen response type: {type(imagen_response_obj)}")
-                    if hasattr(imagen_response_obj, 'candidates') and imagen_response_obj.candidates:
-                        logging.info(f"Response has {len(imagen_response_obj.candidates)} candidates")
-                    
-                    # Try to extract image bytes from the response
-                    if imagen_response_obj and hasattr(imagen_response_obj, 'candidates') and imagen_response_obj.candidates:
-                        # Look for image data in the candidates
-                        for candidate_idx, candidate in enumerate(imagen_response_obj.candidates):
-                            logging.info(f"Examining candidate {candidate_idx+1}")
-                            if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
-                                for part_idx, part in enumerate(candidate.content.parts):
-                                    logging.info(f"Examining part {part_idx+1} of candidate {candidate_idx+1}")
-                                    if hasattr(part, 'inline_data') and part.inline_data:
-                                        logging.info(f"Found inline_data with mime_type: {part.inline_data.mime_type}")
-                                        if part.inline_data.mime_type.startswith("image/"):
-                                            try:
-                                                image_data_bytes = base64.b64decode(part.inline_data.data)
-                                                logging.info(f"Successfully decoded image data. Size: {len(image_data_bytes)} bytes")
-                                                if len(image_data_bytes) < 1000:
-                                                    logging.warning(f"Image data suspiciously small ({len(image_data_bytes)} bytes). May not be a valid image.")
-                                                    if len(image_data_bytes) < 100:
-                                                        logging.error(f"Image too small to be valid, only {len(image_data_bytes)} bytes")
-                                                        continue
-                                                generated_alt_text = image_prompt_for_imagen
-                                                break
-                                            except Exception as e:
-                                                logging.error(f"Error decoding image data: {e}")
-                    
-                    # Log extensive details about response for debugging purposes
-                    if not image_data_bytes and hasattr(imagen_response_obj, 'candidates'):
-                        logging.error("Failed to extract image. Full response structure:")
-                        for candidate_idx, candidate in enumerate(imagen_response_obj.candidates):
-                            logging.error(f"Candidate {candidate_idx+1} content:")
-                            if hasattr(candidate, 'content') and candidate.content:
-                                for part_idx, part in enumerate(candidate.content.parts):
-                                    part_type = "unknown"
-                                    if hasattr(part, 'text'):
-                                        part_type = "text"
-                                        logging.error(f"  Part {part_idx+1}: type={part_type}, content={part.text[:100]}")
-                                    elif hasattr(part, 'inline_data'):
-                                        part_type = "inline_data"
-                                        mime = part.inline_data.mime_type if hasattr(part.inline_data, 'mime_type') else "unknown"
-                                        data_length = len(part.inline_data.data) if hasattr(part.inline_data, 'data') else 0
-                                        logging.error(f"  Part {part_idx+1}: type={part_type}, mime={mime}, data_length={data_length}")
-                                    else:
-                                        logging.error(f"  Part {part_idx+1}: type={part_type}, properties={dir(part)}")
-                    
-                    if image_data_bytes:
-                        logging.info(f"Imagen Attempt {imagen_attempt + 1}: Successfully generated image. Size: {len(image_data_bytes)} bytes")
-                        break # Success, exit Imagen retry loop
+                    # Extract the image bytes from the response
+                    if imagen_response and imagen_response.generated_images and len(imagen_response.generated_images) > 0:
+                        # Get the first generated image
+                        generated_image = imagen_response.generated_images[0]
+                        if generated_image and generated_image.image and generated_image.image.image_bytes:
+                            image_data_bytes = generated_image.image.image_bytes
+                            logging.info(f"Successfully generated image. Size: {len(image_data_bytes)} bytes")
+                            generated_alt_text = image_prompt_for_imagen  # Use the prompt as alt text
+                            break
+                        else:
+                            logging.warning(f"Imagen Attempt {imagen_attempt + 1}: Generated image response missing image data")
                     else:
-                        logging.warning(f"Imagen Attempt {imagen_attempt + 1}: Failed to extract image data from response")
+                        logging.warning(f"Imagen Attempt {imagen_attempt + 1}: No images generated in response")
 
                 except Exception as e:
                     logging.error(f"Imagen Attempt {imagen_attempt + 1}: Imagen generation failed: {e}", exc_info=True)
@@ -623,10 +569,10 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
 
 def main_bot_loop():
     """Main loop for the bot to check for mentions and process them."""
-    global bsky_client, gemini_model, imagen_model, processed_uris_this_run # Ensure access to initialized clients
+    global bsky_client, gemini_model, imagen_client, processed_uris_this_run # Ensure access to initialized clients
 
-    if not (bsky_client and gemini_model and imagen_model):
-        logging.critical("Bluesky client, Gemini model, or Imagen model not initialized. Exiting main loop.")
+    if not (bsky_client and gemini_model and imagen_client):
+        logging.critical("Bluesky client, Gemini model, or Imagen client not initialized. Exiting main loop.")
         return
     
     logging.info("Bot starting main loop...")
@@ -703,24 +649,24 @@ def main_bot_loop():
         time.sleep(MENTION_CHECK_INTERVAL_SECONDS)
 
 def main():
-    global bsky_client, gemini_model, imagen_model # Declare intent to modify globals
+    global bsky_client, gemini_model, imagen_client # Declare intent to modify globals
 
     logging.info("Bot starting...")
     
     bsky_client = initialize_bluesky_client()
     gemini_model = initialize_gemini_model()
-    imagen_model = initialize_imagen_model() # Initialize Imagen model
+    imagen_initialized = initialize_imagen_model() # Initialize Imagen client
 
     # No initial update_seen call based on a loaded timestamp
-    if bsky_client and gemini_model and imagen_model: # Check all models
+    if bsky_client and gemini_model and imagen_initialized: # Check all models
         main_bot_loop()
     else:
         if not bsky_client:
             logging.error("Failed to initialize Bluesky client. Bot cannot start.")
         if not gemini_model:
             logging.error("Failed to initialize Gemini model. Bot cannot start.")
-        if not imagen_model:
-            logging.error("Failed to initialize Imagen model. Bot cannot start.")
+        if not imagen_initialized:
+            logging.error("Failed to initialize Imagen client. Bot cannot start.")
 
 if __name__ == "__main__":
     main()
