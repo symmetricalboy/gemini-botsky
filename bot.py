@@ -27,7 +27,7 @@ BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
-GEMINI_MODEL_NAME = "gemini-2.5-pro" # Use a multimodal model
+GEMINI_MODEL_NAME = "gemini-2.5-pro" # Current attempt, may need to change based on ListModels output
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = "You are a helpful assistant on the Bluesky social network. Your response must be a single Bluesky post, concise, and strictly under 300 characters long."
@@ -67,22 +67,36 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
     
     try:
         genai.configure(api_key=GEMINI_API_KEY)
+
+        # --- TEMPORARY: List available models --- 
+        logging.info("--- Listing Available Gemini Models (for v1beta API) ---")
+        for m in genai.list_models():
+            # Check if 'generateContent' is a supported method for this model
+            if (hasattr(m, 'supported_generation_methods') and 
+                isinstance(m.supported_generation_methods, list) and 
+                'generateContent' in m.supported_generation_methods):
+                logging.info(f"Model: {m.name} (Supports 'generateContent')")
+                # logging.info(f"  Description: {m.description}") 
+                # logging.info(f"  Supported Methods: {m.supported_generation_methods}")
+            else:
+                logging.debug(f"Model: {m.name} (Does NOT support 'generateContent' or info unavailable)") 
+        logging.info("--- Finished Listing Available Models ---")
+        # --- END TEMPORARY --- 
+
         model = genai.GenerativeModel(
-            # Use the multimodal model name
             model_name=GEMINI_MODEL_NAME, 
             system_instruction=BOT_SYSTEM_INSTRUCTION,
-            safety_settings=[ # Adjust safety settings as needed
+            safety_settings=[ 
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
                 {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
             ]
-            # generation_config can be added here if needed, e.g., specifying response mime types
         )
-        logging.info(f"Successfully initialized Gemini model ({GEMINI_MODEL_NAME}).")
+        logging.info(f"Attempting to initialize Gemini model with: {GEMINI_MODEL_NAME}")
         return model
     except Exception as e:
-        logging.error(f"Failed to initialize Gemini model: {e}")
+        logging.error(f"Failed to initialize Gemini model or list models: {e}", exc_info=True)
         return None
 
 def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost, own_handle: str) -> str | None:
