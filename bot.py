@@ -128,7 +128,7 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
                             else:
                                 alt_texts.append("image") # Default if no alt text
                         if alt_texts:
-                            embed_text = f" [User attached: {", ".join(alt_texts)}]"
+                            embed_text = f" [User attached: {', '.join(alt_texts)}]"
                         else:
                             embed_text = " [User attached an image]"
 
