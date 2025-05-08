@@ -249,10 +249,35 @@ def main_bot_loop():
             logging.debug(f"Fetched {len(notifications_response.notifications)} notifications. Checking against last processed ctime: {last_processed_mention_ctime}")
 
             for notification in notifications_response.notifications:
-                logging.debug(f"Checking notification: URI={notification.uri}, Reason={notification.reason}, Author={notification.author.handle}, IndexedAt={getattr(notification, 'indexedAt', 'N/A')}")
-                # Check 1: indexedAt presence and type
-                if not (hasattr(notification, 'indexedAt') and isinstance(notification.indexedAt, str)):
-                    logging.debug(f" -> Skipping notification {notification.cid}: missing or invalid indexedAt.")
+                # Attempt to get indexedAt gracefully
+                indexed_at_value = None
+                raw_notification_data = {} # For logging if needed
+                try:
+                    # Try direct attribute access first (expected)
+                    if hasattr(notification, 'indexedAt') and isinstance(notification.indexedAt, str):
+                        indexed_at_value = notification.indexedAt
+                    else:
+                        # Fallback: Check underlying dict representation (common in pydantic models)
+                        raw_notification_data = notification.dict() # Or notification.model_dump() in newer pydantic
+                        if isinstance(raw_notification_data.get('indexedAt'), str):
+                            indexed_at_value = raw_notification_data.get('indexedAt')
+                        elif isinstance(raw_notification_data.get('indexed_at'), str): # Check snake_case
+                             indexed_at_value = raw_notification_data.get('indexed_at')
+                        
+                except Exception as e:
+                     logging.warning(f"Error accessing notification data for {getattr(notification, 'uri', '[URI UNKNOWN]')}: {e}")
+
+                logging.debug(f"Checking notification: URI={getattr(notification, 'uri', 'N/A')}, Reason={getattr(notification, 'reason', 'N/A')}, Author={getattr(notification.author, 'handle', 'N/A')}, Found IndexedAt='{indexed_at_value}'")
+
+                # Check 1: Valid indexedAt found?
+                if not indexed_at_value:
+                    logging.debug(f" -> Skipping notification {getattr(notification, 'cid', 'N/A')}: Could not find valid 'indexedAt' string field.")
+                    if raw_notification_data: # Log raw data if we tried accessing dict
+                         logging.debug(f"   Raw notification data: {raw_notification_data}")
+                    elif hasattr(notification, 'dict'):
+                         logging.debug(f"   Raw notification data (dict): {notification.dict()}")
+                    elif hasattr(notification, 'model_dump'):
+                         logging.debug(f"   Raw notification data (model_dump): {notification.model_dump()}")
                     continue
 
                 # Check 2: Is it a mention?
@@ -261,7 +286,7 @@ def main_bot_loop():
                     continue
                 
                 # Check 3: Is it newer than the last processed one?
-                current_indexed_at = notification.indexedAt
+                current_indexed_at = indexed_at_value # Use the found value
                 is_new = last_processed_mention_ctime is None or current_indexed_at > last_processed_mention_ctime
                 logging.debug(f" -> Checking if new: Current IndexedAt={current_indexed_at}, Last Processed={last_processed_mention_ctime}, Is New={is_new}")
                 if not is_new:
@@ -270,7 +295,6 @@ def main_bot_loop():
 
                 # Check 4: Is it a mention *by* the bot itself?
                 if notification.author.handle == BLUESKY_HANDLE:
-                    # This check is slightly simplified from before, but achieves the same goal.
                     logging.debug(f" -> Skipping mention {notification.uri}: mention is *by* the bot itself.")
                     continue
 
