@@ -542,18 +542,35 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         # --- End Determine Root and Parent --- 
         
         # Send the reply post
-        logging.info(f"Sending reply to {mentioned_post_uri}: Text='{post_text[:50]}...', HasImage={bool(image_data_bytes)}") # Set HasImage to False
+        logging.info(f"Sending reply to {mentioned_post_uri}: Text='{post_text[:50]}...', HasImage={bool(image_data_bytes)}") 
         
         # Make sure facets is None if empty, not an empty list, as per SDK expectations for some versions.
         facets_to_send = facets if facets else None
 
-        bsky_client.send_post(
-            text=post_text,
-            reply_to=at_models.AppBskyFeedPost.ReplyRef(root=root_ref, parent=parent_ref),
-            embed=embed_to_post, # Use the embed_to_post variable which might contain the image
-            facets=facets_to_send
-        )
-        logging.info(f"Successfully sent reply to {mentioned_post_uri}")
+        try:
+            logging.info(f"Post creation details: Root={root_ref.uri}, Parent={parent_ref.uri}, Text length={len(post_text)}, Embed present={embed_to_post is not None}")
+            
+            # More detailed logging of the parameters being sent
+            if embed_to_post:
+                logging.info(f"Embed type: {type(embed_to_post).__name__}")
+                if hasattr(embed_to_post, 'images') and embed_to_post.images:
+                    logging.info(f"Number of images in embed: {len(embed_to_post.images)}")
+                    for idx, img in enumerate(embed_to_post.images):
+                        logging.info(f"Image {idx+1} alt text: '{img.alt}'")
+                        if hasattr(img, 'image') and img.image:
+                            logging.info(f"Image {idx+1} blob info: type={type(img.image).__name__}, has cid={hasattr(img.image, 'cid')}")
+            
+            response = bsky_client.send_post(
+                text=post_text,
+                reply_to=at_models.AppBskyFeedPost.ReplyRef(root=root_ref, parent=parent_ref),
+                embed=embed_to_post,
+                facets=facets_to_send
+            )
+            
+            logging.info(f"Post creation response: {response}")
+            logging.info(f"Successfully sent reply to {mentioned_post_uri}")
+        except Exception as post_error:
+            logging.error(f"Error creating post: {post_error}", exc_info=True)
 
     except AtProtocolError as e:
         logging.error(f"Bluesky API error processing mention {mentioned_post_uri}: {e}")
