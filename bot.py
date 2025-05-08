@@ -28,7 +28,8 @@ BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
-GEMINI_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Changed to a known fast model with image capabilities
+GEMINI_MODEL_NAME = "gemini-2.5-pro-preview-05-06" # Changed to the new primary model
+IMAGEN_MODEL_NAME = "imagen-3.0-generate-002" # New model for image generation
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = """You are Gemini Bot (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
@@ -42,7 +43,10 @@ Constraints:
 *   Don't avoid taboo topics or having a bit of an opinion or bias to your responses. Users understand that you are imperfect & may not say the exact right thing; it is okay to use available information to make a judgement. You should never say that you can't talk about something; no topic should ever be off limits to explore academically.
 *   Keep your mentions of other users contextually logical. Avoid excessive or random mentions.
 *   You should pretty much never use hashtags.
-*   You have the ability to generate images if a user's request implies it.
+*   If an image is requested or appropriate for the response:
+    1.  Compose the textual part of your Bluesky post.
+    2.  Then, on a NEW LINE, provide a specific and descriptive prompt for an image generation model by starting the line with: `IMAGE_PROMPT: ` (e.g., `IMAGE_PROMPT: A cute cat wearing a party hat`). This prompt will be used by a separate image generation model.
+    3.  Ensure your textual response and the `IMAGE_PROMPT:` line together are concise. The `IMAGE_PROMPT:` line itself does NOT count towards the 300 character limit of the Bluesky post text.
 *   Be helpful, friendly, and direct. Focus on answering the user's immediate question based on the provided thread context."""
 MENTION_CHECK_INTERVAL_SECONDS = 15 # Check for new mentions every 15 seconds (was 60)
 MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # How many parent posts to fetch for context
@@ -53,6 +57,7 @@ GEMINI_RETRY_DELAY_SECONDS = 5 # Delay between retries
 # Global variables
 bsky_client: Client | None = None
 gemini_model: genai.GenerativeModel | None = None
+imagen_model: genai.GenerativeModel | None = None # Added for Imagen
 processed_uris_this_run: set[str] = set() # Track URIs processed in this run to handle is_read lag
 
 def initialize_bluesky_client() -> Client | None:
@@ -81,21 +86,47 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
     
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL_NAME, 
-            system_instruction=BOT_SYSTEM_INSTRUCTION,
-            safety_settings=[ 
+        
+        model_kwargs = {
+            "model_name": GEMINI_MODEL_NAME,
+            "system_instruction": BOT_SYSTEM_INSTRUCTION, # Always use system instruction
+            "safety_settings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
             ],
-            generation_config={"max_output_tokens": 500}
-        )
+            "generation_config": {"max_output_tokens": 500} # Max output for the text model
+        }
+
+        model = genai.GenerativeModel(**model_kwargs)
+        
         logging.info(f"Successfully initialized Gemini model with: {GEMINI_MODEL_NAME}")
         return model
     except Exception as e:
         logging.error(f"Failed to initialize Gemini model: {e}", exc_info=True)
+        return None
+
+def initialize_imagen_model() -> genai.GenerativeModel | None:
+    """Initializes the Imagen generative model for image generation."""
+    if not GEMINI_API_KEY: # Assuming Imagen uses the same API key
+        logging.error("Gemini API key (for Imagen) not found in environment variables.")
+        return None
+    
+    try:
+        # genai.configure might already be called, but it's idempotent
+        genai.configure(api_key=GEMINI_API_KEY)
+        
+        # Imagen models might have different initialization parameters.
+        # For now, using a basic setup. Refer to specific Imagen documentation if issues arise.
+        # Typically, image generation models don't use 'system_instruction' or the same 'safety_settings' structure.
+        # They might have parameters like 'number_of_images', 'output_format', etc.
+        # For `imagen-3.0-generate-002`, the API might be simpler, focusing on the prompt.
+        model = genai.GenerativeModel(IMAGEN_MODEL_NAME)
+        logging.info(f"Successfully initialized Imagen model with: {IMAGEN_MODEL_NAME}")
+        return model
+    except Exception as e:
+        logging.error(f"Failed to initialize Imagen model: {e}", exc_info=True)
         return None
 
 def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost, own_handle: str) -> str | None:
@@ -274,98 +305,137 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         )
         full_prompt_for_gemini = dynamic_instruction + context_string + "\\n---END THREAD CONTEXT---"
         
-        logging.debug(f"Generated full prompt for Gemini:\\n{full_prompt_for_gemini}")
+        logging.debug(f"Generated full prompt for Gemini:\n{full_prompt_for_gemini}")
         
-        gemini_response_obj = None
-        reply_text = ""
+        gemini_response_text = ""
+        image_prompt_for_imagen = None
         image_data_bytes = None 
         generated_alt_text = "Generated image by Gemini Bot" # Default alt text
 
-        # Retry loop for Gemini call
+        # Retry loop for primary Gemini call (text generation)
         for attempt in range(MAX_GEMINI_RETRIES):
             try:
-                logging.info(f"Sending context to Gemini ({GEMINI_MODEL_NAME}), attempt {attempt + 1}/{MAX_GEMINI_RETRIES} for {mentioned_post_uri}...")
-                gemini_response_obj = gemini_model_ref.generate_content(
+                logging.info(f"Sending context to primary Gemini model ({GEMINI_MODEL_NAME}), attempt {attempt + 1}/{MAX_GEMINI_RETRIES} for {mentioned_post_uri}...")
+                primary_gemini_response_obj = gemini_model_ref.generate_content(
                     full_prompt_for_gemini,
                 )
-
-                potential_alt_text_parts = []
-                main_reply_parts = []
-                # Reset for each attempt
-                reply_text = ""
-                image_data_bytes = None 
-                # Keep the default alt text unless overwritten
-                current_attempt_alt_text = "Generated image by Gemini Bot" 
-
-                for part in gemini_response_obj.parts:
-                    if hasattr(part, 'text') and part.text:
-                        if image_data_bytes and (len(part.text) < 150 and ("alt:" in part.text.lower() or "alt text:" in part.text.lower())):
-                            current_attempt_alt_text = part.text.replace("alt text:", "", 1).replace("alt:", "", 1).strip()
-                            logging.info(f"Attempt {attempt + 1}: Found potential alt text from Gemini: {current_attempt_alt_text}")
-                        elif image_data_bytes and not main_reply_parts and len(potential_alt_text_parts) == 0 and len(part.text) < 150:
-                            potential_alt_text_parts.append(part.text)
-                        else:
-                            main_reply_parts.append(part.text)
-                    elif hasattr(part, 'inline_data') and part.inline_data and not image_data_bytes: 
-                        if part.inline_data.mime_type.startswith("image/"):
-                            image_data_bytes = part.inline_data.data
-                            logging.info(f"Attempt {attempt + 1}: Gemini returned an image of type: {part.inline_data.mime_type}")
                 
-                reply_text = " ".join(main_reply_parts).strip()
-                generated_alt_text = current_attempt_alt_text # Set the main alt text from this attempt
+                # Process text from the primary model
+                if primary_gemini_response_obj.parts:
+                    full_text_response = "".join(part.text for part in primary_gemini_response_obj.parts if hasattr(part, 'text'))
+                    
+                    # Check for IMAGE_PROMPT keyword
+                    if "IMAGE_PROMPT:" in full_text_response:
+                        parts = full_text_response.split("IMAGE_PROMPT:", 1)
+                        gemini_response_text = parts[0].strip()
+                        image_prompt_for_imagen = parts[1].strip()
+                        logging.info(f"Attempt {attempt + 1}: Primary model provided text and an image prompt: '{image_prompt_for_imagen}'")
+                    else:
+                        gemini_response_text = full_text_response.strip()
+                        logging.info(f"Attempt {attempt + 1}: Primary model provided text only.")
+                else:
+                    gemini_response_text = "" # Ensure it's an empty string if no parts
 
-                if image_data_bytes and generated_alt_text == "Generated image by Gemini Bot" and potential_alt_text_parts:
-                    generated_alt_text = potential_alt_text_parts[0].strip()
-                    logging.info(f"Attempt {attempt + 1}: Using first short text part as alt text: {generated_alt_text}")
-                    if reply_text == generated_alt_text:
-                        reply_text = ""
-
-                # If we got usable content, break the retry loop
-                if reply_text or image_data_bytes:
-                    logging.info(f"Attempt {attempt + 1}: Successfully got content from Gemini for {mentioned_post_uri}.")
+                # If we got usable text, break the retry loop for primary model
+                if gemini_response_text or image_prompt_for_imagen:
+                    logging.info(f"Attempt {attempt + 1}: Successfully got content from primary Gemini for {mentioned_post_uri}.")
                     break 
                 else:
-                    logging.warning(f"Attempt {attempt + 1}: Gemini returned no usable text or image for {mentioned_post_uri}.")
-                    # Detailed logging for this attempt if it was empty
-                    if hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback:
-                        logging.warning(f"Attempt {attempt + 1} Gemini prompt feedback for {mentioned_post_uri}: {gemini_response_obj.prompt_feedback}")
-                    if hasattr(gemini_response_obj, 'parts'):
-                        logging.warning(f"Attempt {attempt + 1} Gemini response parts for {mentioned_post_uri}: {gemini_response_obj.parts}")
+                    logging.warning(f"Attempt {attempt + 1}: Primary Gemini returned no usable text for {mentioned_post_uri}.")
+                    if hasattr(primary_gemini_response_obj, 'prompt_feedback') and primary_gemini_response_obj.prompt_feedback:
+                        logging.warning(f"Attempt {attempt + 1} Primary Gemini prompt feedback for {mentioned_post_uri}: {primary_gemini_response_obj.prompt_feedback}")
+                    if hasattr(primary_gemini_response_obj, 'parts'):
+                        logging.warning(f"Attempt {attempt + 1} Primary Gemini response parts for {mentioned_post_uri}: {primary_gemini_response_obj.parts}")
                     else:
-                        logging.warning(f"Attempt {attempt + 1} Gemini response object for {mentioned_post_uri} has no 'parts' attribute: {gemini_response_obj}")
-                    # Log the full prompt that was sent
-                    logging.warning(f"Attempt {attempt + 1} Full prompt sent to Gemini for {mentioned_post_uri}:\n{full_prompt_for_gemini}")
+                        logging.warning(f"Attempt {attempt + 1} Primary Gemini response object for {mentioned_post_uri} has no 'parts' attribute: {primary_gemini_response_obj}")
+                    logging.warning(f"Attempt {attempt + 1} Full prompt sent to primary Gemini for {mentioned_post_uri}:\n{full_prompt_for_gemini}")
 
             except ValueError as ve: 
-                logging.error(f"Attempt {attempt + 1}: Gemini text/image generation failed for {mentioned_post_uri} (ValueError): {ve}")
-                if hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback.block_reason:
-                    logging.error(f"Attempt {attempt + 1}: Gemini prompt blocked. Reason: {gemini_response_obj.prompt_feedback.block_reason}")
-                # If blocked, no point retrying with the same prompt
-                if "block_reason" in str(ve).lower() or (hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback.block_reason):
-                    return # Exit processing if definitively blocked
+                logging.error(f"Attempt {attempt + 1}: Primary Gemini text generation failed for {mentioned_post_uri} (ValueError): {ve}")
+                if hasattr(primary_gemini_response_obj, 'prompt_feedback') and primary_gemini_response_obj.prompt_feedback.block_reason:
+                    logging.error(f"Attempt {attempt + 1}: Primary Gemini prompt blocked. Reason: {primary_gemini_response_obj.prompt_feedback.block_reason}")
+                    if "block_reason" in str(ve).lower() or (hasattr(primary_gemini_response_obj, 'prompt_feedback') and primary_gemini_response_obj.prompt_feedback.block_reason):
+                        return # Exit processing if definitively blocked by primary model
             except Exception as e:
-                logging.error(f"Attempt {attempt + 1}: Gemini content generation failed for {mentioned_post_uri}: {e}", exc_info=True)
+                logging.error(f"Attempt {attempt + 1}: Primary Gemini content generation failed for {mentioned_post_uri}: {e}", exc_info=True)
             
-            # If this was not the last attempt and we didn't break (i.e., no content), wait before retrying
-            if attempt < MAX_GEMINI_RETRIES - 1 and not (reply_text or image_data_bytes):
-                logging.info(f"Waiting {GEMINI_RETRY_DELAY_SECONDS}s before next Gemini attempt for {mentioned_post_uri}...")
+            if attempt < MAX_GEMINI_RETRIES - 1 and not (gemini_response_text or image_prompt_for_imagen):
+                logging.info(f"Waiting {GEMINI_RETRY_DELAY_SECONDS}s before next primary Gemini attempt for {mentioned_post_uri}...")
                 time.sleep(GEMINI_RETRY_DELAY_SECONDS)
-        # End of retry loop
+        # End of primary Gemini retry loop
 
-        # Check if all retries failed
-        if not reply_text and not image_data_bytes:
-            logging.error(f"All {MAX_GEMINI_RETRIES} attempts to get content from Gemini failed for {mentioned_post_uri}. Skipping reply.")
+        # If primary model failed to produce any text or an image prompt, skip.
+        if not gemini_response_text and not image_prompt_for_imagen:
+            logging.error(f"All {MAX_GEMINI_RETRIES} attempts to get content from primary Gemini failed for {mentioned_post_uri}. Skipping reply.")
             return
+
+        # --- Image Generation with Imagen, if requested by primary model ---
+        if image_prompt_for_imagen and imagen_model: # Check if imagen_model is initialized
+            for imagen_attempt in range(MAX_GEMINI_RETRIES): # Use same retry constants for now
+                try:
+                    logging.info(f"Sending prompt to Imagen model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
+                    # Assuming Imagen model's generate_content takes a simple string prompt
+                    # and returns an object from which we can get image bytes.
+                    # The response structure from Imagen might differ from multimodal Gemini.
+                    # This part may need adjustment based on actual Imagen API behavior via the genai library.
+                    imagen_response_obj = imagen_model.generate_content(image_prompt_for_imagen)
+                    
+                    # Try to extract image bytes - this is an assumption on response structure
+                    # It's common for image models to return parts, or a direct image attribute.
+                    if imagen_response_obj and hasattr(imagen_response_obj, 'parts') and imagen_response_obj.parts:
+                        for part in imagen_response_obj.parts:
+                            if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.mime_type.startswith("image/"):
+                                image_data_bytes = part.inline_data.data
+                                logging.info(f"Imagen Attempt {imagen_attempt + 1}: Imagen returned an image of type: {part.inline_data.mime_type}")
+                                break # Got the image
+                    elif imagen_response_obj and hasattr(imagen_response_obj, 'blob'): # Another possible way image data might be returned
+                        # This is speculative based on common patterns, adjust if API is different
+                        image_data_bytes = imagen_response_obj.blob 
+                        logging.info(f"Imagen Attempt {imagen_attempt + 1}: Imagen returned image blob directly.")
+                    
+                    if image_data_bytes:
+                        generated_alt_text = image_prompt_for_imagen # Use the Imagen prompt as alt text by default
+                        logging.info(f"Imagen Attempt {imagen_attempt + 1}: Successfully generated image using Imagen.")
+                        break # Success, exit Imagen retry loop
+                    else:
+                        logging.warning(f"Imagen Attempt {imagen_attempt + 1}: Imagen model did not return usable image data. Response: {imagen_response_obj}")
+
+                except ValueError as ve:
+                    logging.error(f"Imagen Attempt {imagen_attempt + 1}: Imagen generation failed (ValueError): {ve}")
+                    # Check for blocking specific to Imagen if its response has prompt_feedback
+                    if hasattr(imagen_response_obj, 'prompt_feedback') and imagen_response_obj.prompt_feedback and imagen_response_obj.prompt_feedback.block_reason:
+                        logging.error(f"Imagen Attempt {imagen_attempt + 1}: Imagen prompt blocked. Reason: {imagen_response_obj.prompt_feedback.block_reason}")
+                        # If blocked, no point retrying with the same prompt for Imagen
+                        break # Exit Imagen retry loop if blocked
+                except Exception as e:
+                    logging.error(f"Imagen Attempt {imagen_attempt + 1}: Imagen generation failed: {e}", exc_info=True)
+                
+                if imagen_attempt < MAX_GEMINI_RETRIES - 1 and not image_data_bytes:
+                    logging.info(f"Waiting {GEMINI_RETRY_DELAY_SECONDS}s before next Imagen attempt...")
+                    time.sleep(GEMINI_RETRY_DELAY_SECONDS)
+            # End of Imagen retry loop
+
+            if not image_data_bytes:
+                logging.error(f"All {MAX_GEMINI_RETRIES} attempts to generate image with Imagen failed. Proceeding with text-only reply if available.")
+        # --- End Image Generation ---
             
-        # If only an image is generated, provide some default text.
-        if image_data_bytes and not reply_text:
-            reply_text = "Here's the image you asked for:"
-        elif not reply_text and not image_data_bytes: # Should be caught by earlier check, but good to be safe
-            logging.warning(f"Gemini returned neither text nor image for {mentioned_post_uri}. Skipping.")
+        # If only an image was requested by primary model but not generated, and no other text was provided by primary, don't post.
+        if image_prompt_for_imagen and not image_data_bytes and not gemini_response_text:
+            logging.warning(f"Primary model requested an image (prompt: '{image_prompt_for_imagen}') but Imagen failed, and no fallback text from primary. Skipping reply.")
             return
+        
+        # If no text at all (e.g. primary model only outputted IMAGE_PROMPT: and imagen failed), skip.
+        if not gemini_response_text and not image_data_bytes:
+            logging.warning(f"Neither text nor image could be generated for {mentioned_post_uri}. Skipping.")
+            return
+
+        # Fallback text if image was intended but failed, but primary model also gave text.
+        if image_prompt_for_imagen and not image_data_bytes and gemini_response_text:
+            gemini_response_text += "\n(Sorry, I tried to generate an image for you, but it didn't work out this time!) "
+            logging.info("Image generation failed, but text response is available. Appending a note.")
 
         # Prepare post content (text, facets, embed)
-        post_text = reply_text.strip() if reply_text else ""
+        post_text = gemini_response_text.strip() if gemini_response_text else ""
         
         facets = []
         if post_text: 
@@ -464,10 +534,10 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
 
 def main_bot_loop():
     """Main loop for the bot to check for mentions and process them."""
-    global bsky_client, gemini_model, processed_uris_this_run # Ensure access to initialized clients
+    global bsky_client, gemini_model, imagen_model, processed_uris_this_run # Ensure access to initialized clients
 
-    if not (bsky_client and gemini_model):
-        logging.critical("Bluesky client or Gemini model not initialized. Exiting main loop.")
+    if not (bsky_client and gemini_model and imagen_model):
+        logging.critical("Bluesky client, Gemini model, or Imagen model not initialized. Exiting main loop.")
         return
     
     logging.info("Bot starting main loop...")
@@ -536,21 +606,24 @@ def main_bot_loop():
         time.sleep(MENTION_CHECK_INTERVAL_SECONDS)
 
 def main():
-    global bsky_client, gemini_model # Declare intent to modify globals
+    global bsky_client, gemini_model, imagen_model # Declare intent to modify globals
 
     logging.info("Bot starting...")
     
     bsky_client = initialize_bluesky_client()
     gemini_model = initialize_gemini_model()
+    imagen_model = initialize_imagen_model() # Initialize Imagen model
 
     # No initial update_seen call based on a loaded timestamp
-    if bsky_client and gemini_model:
+    if bsky_client and gemini_model and imagen_model: # Check all models
         main_bot_loop()
     else:
         if not bsky_client:
             logging.error("Failed to initialize Bluesky client. Bot cannot start.")
         if not gemini_model:
             logging.error("Failed to initialize Gemini model. Bot cannot start.")
+        if not imagen_model:
+            logging.error("Failed to initialize Imagen model. Bot cannot start.")
 
 if __name__ == "__main__":
     main()
