@@ -29,7 +29,7 @@ BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
-GEMINI_MODEL_NAME = "models/gemini-2.0-flash-latest" # Changed based on ListModels output
+GEMINI_MODEL_NAME = "gemini-2.0-flash" # Correct model name without prefix or suffix
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = "You are a helpful assistant on the Bluesky social network. Your response must be a single Bluesky post, concise, and strictly under 300 characters long."
