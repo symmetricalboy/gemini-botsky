@@ -404,7 +404,6 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                         ],
                         generation_config={
                             "temperature": 0.4,
-                            "response_mime_type": "image/png",
                             "response_modalities": ["TEXT", "IMAGE"]
                         }
                     )
