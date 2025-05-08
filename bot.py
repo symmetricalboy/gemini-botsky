@@ -28,7 +28,7 @@ BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
-GEMINI_MODEL_NAME = "gemini-2.5-pro-preview-05-06" # Updated model name
+GEMINI_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Changed to a known fast model with image capabilities
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = """You are Gemini Bot (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
@@ -333,6 +333,8 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                         logging.warning(f"Attempt {attempt + 1} Gemini response parts for {mentioned_post_uri}: {gemini_response_obj.parts}")
                     else:
                         logging.warning(f"Attempt {attempt + 1} Gemini response object for {mentioned_post_uri} has no 'parts' attribute: {gemini_response_obj}")
+                    # Log the full prompt that was sent
+                    logging.warning(f"Attempt {attempt + 1} Full prompt sent to Gemini for {mentioned_post_uri}:\n{full_prompt_for_gemini}")
 
             except ValueError as ve: 
                 logging.error(f"Attempt {attempt + 1}: Gemini text/image generation failed for {mentioned_post_uri} (ValueError): {ve}")
