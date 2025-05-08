@@ -164,7 +164,7 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
             logging.info(f"Gemini returned an empty response for {mentioned_post_uri}. Skipping reply.")
             return
 
-        logging.info(f"Gemini reply for {mentioned_post_uri}: "{reply_text[:50]}..."")
+        logging.info(f'Gemini reply for {mentioned_post_uri}: "{reply_text[:50]}..."')
 
         # Determine root and parent for the reply
         # The post we are replying to is target_post (thread_view_of_mentioned_post.post)
