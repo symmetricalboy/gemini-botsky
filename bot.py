@@ -282,43 +282,26 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 logging.error(f"Error during image upload or embed creation: {e}", exc_info=True)
                 # Proceed without image if upload fails
         
-        # Root and parent for the reply
-        reply_root = thread_view_of_mentioned_post.root if thread_view_of_mentioned_post.root else target_post.uri
-        reply_parent = target_post.uri # Reply directly to the post that mentioned the bot
-
-        # Ensure reply_root and reply_parent are FeedViewPost or PostView objects from which .uri and .cid can be extracted
-        # The API expects models.ComAtprotoRepoStrongRef.Main objects for root and parent
-        if isinstance(reply_root, (at_models.AppBskyFeedDefs.PostView, at_models.AppBskyFeedDefs.ThreadViewPost)): # type: ignore
-            root_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=reply_root.cid, uri=reply_root.uri) # type: ignore
-        elif isinstance(reply_root, str): # If it's already a URI string (e.g. target_post.uri)
-            # We need to fetch the post to get its CID for StrongRef, or API might allow just URI for non-validated refs
-            # For simplicity, if it's the target_post, we have its CID
-            if reply_root == target_post.uri:
-                 root_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
-            else: # Fallback if root is a URI string and not target_post (less ideal)
-                 logging.warning(f"Root post {reply_root} is a URI string, attempting to use directly. May need CID.")
-                 # This might fail if API strictly needs CID. Fetching post to get CID is more robust.
-                 # For now, let's assume it might work or the SDK handles it.
-                 # A better approach would be to ensure we always have the PostView for the root.
-                 # However, target_post.uri for reply_root when target_post is the actual root is fine.
-                 # Let's refine this: if thread_view_of_mentioned_post.root is a string, it's a URI.
-                 # We need its CID.
-                 # The `target_post` is `thread_view_of_mentioned_post.post`.
-                 # If `thread_view_of_mentioned_post.root` is a string (URI), we'd need to fetch that post
-                 # to get its CID. For now, we simplify: if `thread_view_of_mentioned_post.root` is a string,
-                 # we'll use `target_post` as root if `target_post` has no parent (i.e., it *is* the root).
-                 if not thread_view_of_mentioned_post.parent: # target_post is the root
-                     root_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
-                 else: # Root is some other post, and we only have its URI. This is problematic.
-                       # Fallback: Use target_post as root if actual root CID is missing.
-                       logging.warning(f"Actual root URI {reply_root} lacks CID. Using triggering post {target_post.uri} as root instead.")
-                       root_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
-
-        else: # Fallback if reply_root is not a PostView or URI string (e.g. a BlockedPost or NotFoundPost)
-            logging.warning(f"Root post {reply_root} is not a PostView. Using triggering post {target_post.uri} as root.")
-            root_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
-
+        # --- Determine Root and Parent for the Reply --- 
+        # The parent of our reply is always the post that triggered the notification (target_post).
         parent_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
+
+        # Determine the root of the thread.
+        root_ref = None
+        post_record = target_post.record # Get the record data of the target post
+        
+        # Check if the target post's record is a standard post record and if it contains reply info
+        if isinstance(post_record, at_models.AppBskyFeedPost.Record) and post_record.reply:
+            # If target_post is itself a reply, use the root specified in its reply reference.
+            root_ref = post_record.reply.root
+            logging.debug(f"Target post {target_post.uri} is a reply. Using its root: {root_ref.uri}")
+        
+        # If target_post is not a reply, or if we couldn't get the root ref from its record,
+        # then the target_post itself serves as the root for our reply.
+        if root_ref is None:
+            root_ref = parent_ref # Use the target_post's StrongRef as the root
+            logging.debug(f"Target post {target_post.uri} is not a reply (or root ref missing). Using target post as root.")
+        # --- End Determine Root and Parent --- 
         
         # Send the reply post
         logging.info(f"Sending reply to {mentioned_post_uri}: Text='{post_text[:50]}...', HasImage={image_data_bytes is not None}")
