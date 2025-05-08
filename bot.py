@@ -243,7 +243,9 @@ def main_bot_loop():
                 time.sleep(MENTION_CHECK_INTERVAL_SECONDS)
                 continue
 
-            new_mentions_to_process = []
+            # new_mentions_to_process = [] # Old list
+            mentions_to_process_with_ts = [] # New list to store (timestamp, mention) tuples
+            
             # latest_ctime_in_batch = last_processed_mention_ctime # This wasn't used
 
             logging.debug(f"Fetched {len(notifications_response.notifications)} notifications. Checking against last processed ctime: {last_processed_mention_ctime}")
@@ -300,24 +302,28 @@ def main_bot_loop():
 
                 # If all checks passed:
                 logging.debug(f" -> Adding new mention from {notification.author.handle} ({current_indexed_at}) to process list: {notification.uri}")
-                new_mentions_to_process.append(notification)
+                # new_mentions_to_process.append(notification) # Old way
+                mentions_to_process_with_ts.append((current_indexed_at, notification)) # Store as tuple
 
             # Process the found mentions (oldest first based on sort)
-            new_mentions_to_process.sort(key=lambda n: n.indexedAt)
+            # new_mentions_to_process.sort(key=lambda n: n.indexedAt) # Old sort - caused error
+            mentions_to_process_with_ts.sort(key=lambda item: item[0]) # Sort by timestamp
 
-            if not new_mentions_to_process:
+            if not mentions_to_process_with_ts:
                  logging.debug(f"No mentions found in this batch meeting criteria (new and not self-mention). Last processed ctime: {last_processed_mention_ctime}")
 
-            for mention in new_mentions_to_process:
+            # for mention in new_mentions_to_process: # Old iteration
+            for timestamp, mention in mentions_to_process_with_ts: # Iterate through sorted tuples
                 # Add logging at the start of process_mention as well
-                logging.info(f"Starting processing for mention: {mention.uri}") 
+                logging.info(f"Starting processing for mention: {mention.uri} (Timestamp: {timestamp})") 
                 process_mention(mention, gemini_model)
                 # Update last processed time
-                if last_processed_mention_ctime is None or mention.indexedAt > last_processed_mention_ctime:
-                    last_processed_mention_ctime = mention.indexedAt
+                # Use the timestamp we already have from the tuple
+                if last_processed_mention_ctime is None or timestamp > last_processed_mention_ctime:
+                    last_processed_mention_ctime = timestamp
             
-            if new_mentions_to_process:
-                logging.info(f"Finished processing {len(new_mentions_to_process)} new mentions. Last processed ctime updated to: {last_processed_mention_ctime}")
+            if mentions_to_process_with_ts:
+                logging.info(f"Finished processing {len(mentions_to_process_with_ts)} new mentions. Last processed ctime updated to: {last_processed_mention_ctime}")
             # else:
                 # logging.debug(f"No new, unread mentions found. Current last processed ctime: {last_processed_mention_ctime}") # Removed redundant log
 
