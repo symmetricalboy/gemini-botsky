@@ -1,0 +1,8 @@
+# Python standard library
+
+# Third-party libraries
+atproto
+google-generativeai
+python-dotenv
+
+# Add other dependencies here as needed 
