@@ -375,13 +375,9 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 try:
                     logging.info(f"Sending prompt to Imagen model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
                     
-                    # Explicitly request an image response modality
-                    image_generation_config = genai.types.GenerationConfig(response_mime_type="image/png") 
-
-                    imagen_response_obj = imagen_model.generate_content(
-                        image_prompt_for_imagen,
-                        generation_config=image_generation_config
-                    )
+                    # The model infers image generation from the prompt and its capabilities.
+                    # We don't need/can't use response_mime_type for image generation here.
+                    imagen_response_obj = imagen_model.generate_content(image_prompt_for_imagen)
                     
                     # Try to extract image bytes - this is an assumption on response structure
                     # It's common for image models to return parts, or a direct image attribute.
