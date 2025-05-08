@@ -229,52 +229,58 @@ def main_bot_loop():
                 continue
 
             new_mentions_to_process = []
-            latest_ctime_in_batch = last_processed_mention_ctime
+            # latest_ctime_in_batch = last_processed_mention_ctime # This wasn't used
+
+            logging.debug(f"Fetched {len(notifications_response.notifications)} notifications. Checking against last processed ctime: {last_processed_mention_ctime}")
 
             for notification in notifications_response.notifications:
-                # Ensure indexedAt is present and a string
+                logging.debug(f"Checking notification: URI={notification.uri}, Reason={notification.reason}, Author={notification.author.handle}, IndexedAt={getattr(notification, 'indexedAt', 'N/A')}")
+                # Check 1: indexedAt presence and type
                 if not (hasattr(notification, 'indexedAt') and isinstance(notification.indexedAt, str)):
-                    logging.debug(f"Notification missing or invalid indexedAt: {notification.cid}")
+                    logging.debug(f" -> Skipping notification {notification.cid}: missing or invalid indexedAt.")
                     continue
 
-                # We are interested in mentions that are newer than the last one processed
-                if notification.reason == 'mention':
-                    is_new = last_processed_mention_ctime is None or notification.indexedAt > last_processed_mention_ctime
-                    # And ensure it's not a mention by the bot itself (if record accessible and contains text)
-                    # This check is basic; a mention notification should typically be for the authenticated user.
-                    # However, let's also ensure we don't reply to our own posts if they somehow trigger a mention notif to self.
-                    if hasattr(notification, 'record') and isinstance(notification.record, models.AppBskyFeedPost.Main):
-                         if notification.author.handle == BLUESKY_HANDLE : # and f"@{BLUESKY_HANDLE}" in notification.record.text:
-                            logging.debug(f"Skipping self-mention from {notification.author.handle} in {notification.uri}")
-                            continue
+                # Check 2: Is it a mention?
+                if notification.reason != 'mention':
+                    logging.debug(f" -> Skipping notification {notification.uri}: reason is not 'mention' ({notification.reason}).")
+                    continue
+                
+                # Check 3: Is it newer than the last processed one?
+                current_indexed_at = notification.indexedAt
+                is_new = last_processed_mention_ctime is None or current_indexed_at > last_processed_mention_ctime
+                logging.debug(f" -> Checking if new: Current IndexedAt={current_indexed_at}, Last Processed={last_processed_mention_ctime}, Is New={is_new}")
+                if not is_new:
+                    logging.debug(f" -> Skipping mention {notification.uri}: not newer than last processed.")
+                    continue
 
+                # Check 4: Is it a mention *by* the bot itself?
+                if notification.author.handle == BLUESKY_HANDLE:
+                    # This check is slightly simplified from before, but achieves the same goal.
+                    logging.debug(f" -> Skipping mention {notification.uri}: mention is *by* the bot itself.")
+                    continue
 
-                    if is_new:
-                        # Check if the reason is a mention and if the author is not the bot itself
-                        if notification.author.handle != BLUESKY_HANDLE:
-                             new_mentions_to_process.append(notification)
-                        else:
-                            logging.debug(f"Skipping own mention notification: {notification.uri}")
+                # If all checks passed:
+                logging.debug(f" -> Adding new mention from {notification.author.handle} ({current_indexed_at}) to process list: {notification.uri}")
+                new_mentions_to_process.append(notification)
 
-
-            # Process newest mentions first by sorting, or oldest first by reversing current list
-            # The list_notifications typically returns newest first. Let's process them in the order received (newest first).
-            # Or, to be chronological if multiple new ones: sort by indexedAt ascending.
+            # Process the found mentions (oldest first based on sort)
             new_mentions_to_process.sort(key=lambda n: n.indexedAt)
 
+            if not new_mentions_to_process:
+                 logging.debug(f"No mentions found in this batch meeting criteria (new and not self-mention). Last processed ctime: {last_processed_mention_ctime}")
 
             for mention in new_mentions_to_process:
+                # Add logging at the start of process_mention as well
+                logging.info(f"Starting processing for mention: {mention.uri}") 
                 process_mention(mention, gemini_model)
-                # Update last_processed_mention_ctime after successfully processing (or attempting to process)
-                # This ensures we don't reprocess even if an error occurred downstream,
-                # unless specific retry logic is added for certain errors.
+                # Update last processed time
                 if last_processed_mention_ctime is None or mention.indexedAt > last_processed_mention_ctime:
                     last_processed_mention_ctime = mention.indexedAt
             
             if new_mentions_to_process:
-                logging.info(f"Processed {len(new_mentions_to_process)} new mentions. Last processed ctime: {last_processed_mention_ctime}")
-            else:
-                logging.debug(f"No new, unread mentions found. Current last processed ctime: {last_processed_mention_ctime}")
+                logging.info(f"Finished processing {len(new_mentions_to_process)} new mentions. Last processed ctime updated to: {last_processed_mention_ctime}")
+            # else:
+                # logging.debug(f"No new, unread mentions found. Current last processed ctime: {last_processed_mention_ctime}") # Removed redundant log
 
         except AtProtocolError as e:
             # Attempt to access e.response and e.response.status_code carefully
