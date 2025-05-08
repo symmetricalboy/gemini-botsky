@@ -32,7 +32,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
 GEMINI_MODEL_NAME = "gemini-2.5-pro-preview-05-06" # Primary model for text and system instructions
-IMAGEN_MODEL_NAME = "imagen-3.0-generate-001" # Updated to use Imagen 3 model
+IMAGEN_MODEL_NAME = "imagen-3.0-generate-002" # Updated to use Imagen 3 model
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = """You are Gemini (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
