@@ -87,7 +87,7 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
         if isinstance(current_view, models.AppBskyFeedDefs.ThreadViewPost) and current_view.post:
             post_record = current_view.post.record
             # We are interested in app.bsky.feed.post records with text
-            if isinstance(post_record, models.AppBskyFeedPost.Main) and hasattr(post_record, 'text'):
+            if isinstance(post_record, models.AppBskyFeedPost.Record) and hasattr(post_record, 'text'):
                 author_display_name = current_view.post.author.display_name or current_view.post.author.handle
                 text = post_record.text
                 # Optional: filter out bot's own previous messages if own_handle == current_view.post.author.handle
@@ -107,7 +107,7 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
     if not history:
         logging.warning("Could not construct any context from the thread.")
         # Attempt to use the main post text directly if it's a text post
-        if isinstance(thread_view.post.record, models.AppBskyFeedPost.Main) and hasattr(thread_view.post.record, 'text'):
+        if isinstance(thread_view.post.record, models.AppBskyFeedPost.Record) and hasattr(thread_view.post.record, 'text'):
             author_display_name = thread_view.post.author.display_name or thread_view.post.author.handle
             return f"{author_display_name} (@{thread_view.post.author.handle}): {thread_view.post.record.text}"
         return None # "Unable to retrieve thread context." -> handled by None return
@@ -180,7 +180,7 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
         parent_strong_ref = models.ComAtprotoRepoStrongRef.Main(uri=target_post.uri, cid=target_post.cid)
 
         # Determine the root of the thread
-        if target_post.record and isinstance(target_post.record, models.AppBskyFeedPost.Main) and target_post.record.reply:
+        if target_post.record and isinstance(target_post.record, models.AppBskyFeedPost.Record) and target_post.record.reply:
             root_ref_input = target_post.record.reply.root
         else: # The post itself is the root or not a valid reply structure
             root_ref_input = target_post
@@ -305,6 +305,14 @@ def main_bot_loop():
                 if notification.author.handle == BLUESKY_HANDLE:
                     logging.debug(f" -> Skipping mention {notification.uri}: mention is *by* the bot itself.")
                     continue
+
+                # This check is basic; a mention notification should typically be for the authenticated user.
+                # However, let's also ensure we don't reply to our own posts if they somehow trigger a mention notif to self.
+                # Use Record instead of Main for type check
+                if hasattr(notification, 'record') and isinstance(notification.record, models.AppBskyFeedPost.Record):
+                     if notification.author.handle == BLUESKY_HANDLE : # and f"@{BLUESKY_HANDLE}" in notification.record.text:
+                        logging.debug(f"Skipping self-mention from {notification.author.handle} in {notification.uri}")
+                        continue
 
                 # If all checks passed:
                 logging.debug(f" -> Adding new mention from {notification.author.handle} ({current_indexed_at}) to process list: {notification.uri}")
