@@ -15,7 +15,7 @@ from atproto_client.models.app.bsky.feed.get_post_thread import Params as GetPos
 from atproto import models as at_models 
 
 # Configure basic logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load environment variables
 load_dotenv()
@@ -255,13 +255,13 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
                     logging.warning(f"Could not find byte offset for mention '{handle_with_at}' in reply text. Skipping facet.")
                     continue
 
-                logging.debug(f"Found potential mention: {handle_with_at} (bytes {byte_start}-{byte_end})")
+                logging.info(f"Found potential mention: {handle_with_at} (bytes {byte_start}-{byte_end})")
 
                 try:
                     # Resolve handle to DID
                     resolve_response = bsky_client.resolve_handle(handle=handle_only)
                     resolved_did = resolve_response.did
-                    logging.debug(f"Resolved {handle_only} to DID: {resolved_did}")
+                    logging.info(f"Resolved {handle_only} to DID: {resolved_did}")
                     
                     # Create mention feature and facet
                     mention_feature = at_models.AppBskyRichtextFacet.Mention(did=resolved_did)
