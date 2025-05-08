@@ -156,41 +156,53 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
             parent_view = thread_view_of_mentioned_post.parent
             # Check if parent exists and is a valid post view
             if isinstance(parent_view, models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
-                parent_uri = parent_view.post.uri
-                logging.debug(f"Checking for duplicate reply to parent post: {parent_uri}")
-                try:
-                    # Fetch the parent thread specifically to check its replies accurately
-                    parent_params = GetPostThreadParams(uri=parent_uri, depth=1) # Depth 1 is sufficient
-                    parent_thread_response = bsky_client.app.bsky.feed.get_post_thread(params=parent_params)
-                    
-                    if isinstance(parent_thread_response.thread, models.AppBskyFeedDefs.ThreadViewPost) and parent_thread_response.thread.replies:
-                        for reply_to_parent in parent_thread_response.thread.replies:
-                            if reply_to_parent.post and reply_to_parent.post.author and reply_to_parent.post.author.handle == BLUESKY_HANDLE:
-                                already_replied = True
-                                logging.info(f"Detected existing reply by bot ({BLUESKY_HANDLE}) to parent post {parent_uri}. Skipping reply to {target_post.uri}.")
-                                break # Found duplicate
-                    else:
-                        logging.debug(f"Parent post {parent_uri} has no replies according to its thread view.")
-                        
-                except AtProtocolError as e:
-                    logging.error(f"Failed to fetch parent thread {parent_uri} to check for duplicates: {e}")
-                    # Decide whether to proceed cautiously or skip? Skipping is safer for now.
-                    already_replied = True # Treat as duplicate if check failed
-                    logging.warning(f"Skipping reply to {target_post.uri} due to error checking parent.")
-                except Exception as e:
-                    logging.error(f"Unexpected error fetching parent thread {parent_uri}: {e}", exc_info=True)
-                    already_replied = True # Treat as duplicate if check failed
-                    logging.warning(f"Skipping reply to {target_post.uri} due to error checking parent.")
-                    
+                 parent_post = parent_view.post
+                 # Check 1: Is the PARENT post author the bot?
+                 if parent_post.author.handle != BLUESKY_HANDLE:
+                     logging.info(f"Skipping reply notification {notification.uri}: Parent post {parent_post.uri} not authored by bot ({BLUESKY_HANDLE}).")
+                     return # Exit processing, not a direct reply to the bot
+                 
+                 # Check 2: Is the PARENT post *itself* a reply? (i.e. is this a reply-to-a-reply?)
+                 if isinstance(parent_post.record, models.AppBskyFeedPost.Record) and parent_post.record.reply:
+                     logging.info(f"Skipping reply notification {notification.uri}: Parent post {parent_post.uri} is itself a reply. Avoiding reply-to-reply chain.")
+                     return # Exit processing, don't reply to replies-to-replies
+
+                 # If parent is by bot AND is not a reply, THEN check for existing bot replies to it
+                 logging.debug(f"Reply {notification.uri} is to an original bot post {parent_post.uri}. Checking for duplicates.")
+                 parent_uri = parent_post.uri
+                 try:
+                     # Fetch the parent thread specifically to check its replies accurately
+                     parent_params = GetPostThreadParams(uri=parent_uri, depth=1) # Depth 1 is sufficient
+                     parent_thread_response = bsky_client.app.bsky.feed.get_post_thread(params=parent_params)
+                     
+                     if isinstance(parent_thread_response.thread, models.AppBskyFeedDefs.ThreadViewPost) and parent_thread_response.thread.replies:
+                         for reply_to_parent in parent_thread_response.thread.replies:
+                             if reply_to_parent.post and reply_to_parent.post.author and reply_to_parent.post.author.handle == BLUESKY_HANDLE:
+                                 already_replied = True
+                                 logging.info(f"Detected existing reply by bot ({BLUESKY_HANDLE}) to parent post {parent_uri}. Skipping reply to {target_post.uri}.")
+                                 break # Found duplicate
+                     else:
+                         logging.debug(f"Parent post {parent_uri} has no replies according to its thread view.")
+                         
+                 except AtProtocolError as e:
+                     logging.error(f"Failed to fetch parent thread {parent_uri} to check for duplicates: {e}")
+                     # Decide whether to proceed cautiously or skip? Skipping is safer for now.
+                     already_replied = True # Treat as duplicate if check failed
+                     logging.warning(f"Skipping reply to {target_post.uri} due to error checking parent.")
+                 except Exception as e:
+                     logging.error(f"Unexpected error fetching parent thread {parent_uri}: {e}", exc_info=True)
+                     already_replied = True # Treat as duplicate if check failed
+                     logging.warning(f"Skipping reply to {target_post.uri} due to error checking parent.")
             else:
                  # If we can't identify the parent post from the initial thread view
                  logging.warning(f"Could not identify parent post for reply notification {notification.uri}. Skipping duplicate check (and reply for safety)." )
                  already_replied = True # Skip if parent structure is unclear
         # <<< END NEW CHECK >>>
 
-        # <<< START CHECK FOR EXISTING REPLY >>>
+        # <<< START CHECK FOR EXISTING REPLY (Now combined with above logic) >>>
         # Check if the bot has already replied, depending on the notification type
-        already_replied = False
+        # The already_replied flag is set above for the 'reply' case if needed
+        # Only need to explicitly check for the 'mention' case here
         if notification.reason == 'mention':
             # For mentions, check if bot replied directly to the mentioned post
             if thread_view_of_mentioned_post.replies:
@@ -199,24 +211,6 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
                         already_replied = True
                         logging.info(f"Detected existing reply by bot to mentioned post {target_post.uri}. Skipping duplicate reply.")
                         break
-        elif notification.reason == 'reply':
-            # For replies, check if bot replied to the *parent* of this new reply
-            parent_view = thread_view_of_mentioned_post.parent
-            # Check if parent exists and has replies attribute
-            if parent_view and hasattr(parent_view, 'replies') and parent_view.replies:
-                 # Ensure parent_view itself is a post we can check replies on
-                 if isinstance(parent_view, models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
-                    parent_uri = parent_view.post.uri
-                    for reply in parent_view.replies:
-                        if reply.post and reply.post.author and reply.post.author.handle == BLUESKY_HANDLE:
-                            already_replied = True
-                            logging.info(f"Detected existing reply by bot to parent post {parent_uri}. Skipping reply to {target_post.uri}.")
-                            break
-                 else:
-                      logging.debug(f"Parent view for reply {target_post.uri} is not a ThreadViewPost or has no post data, cannot check for duplicate replies effectively.")
-            else:
-                 logging.debug(f"Reply {target_post.uri} has no parent view or parent has no replies, cannot check for duplicate replies.")
-                 
         if already_replied:
             return # Exit processing for this mention/reply
         # <<< END CHECK FOR EXISTING REPLY >>>
@@ -391,7 +385,7 @@ def main_bot_loop():
                         indexed_at_value = notification.indexedAt
                     else:
                         # Fallback: Check underlying dict representation (common in pydantic models)
-                        raw_notification_data = notification.dict() # Or notification.model_dump() in newer pydantic
+                        raw_notification_data = notification.model_dump() # Use model_dump
                         if isinstance(raw_notification_data.get('indexedAt'), str):
                             indexed_at_value = raw_notification_data.get('indexedAt')
                         elif isinstance(raw_notification_data.get('indexed_at'), str): # Check snake_case
