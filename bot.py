@@ -162,13 +162,8 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
                      logging.info(f"Skipping reply notification {notification.uri}: Parent post {parent_post.uri} not authored by bot ({BLUESKY_HANDLE}).")
                      return # Exit processing, not a direct reply to the bot
                  
-                 # Check 2: Is the PARENT post *itself* a reply? (i.e. is this a reply-to-a-reply?)
-                 if isinstance(parent_post.record, models.AppBskyFeedPost.Record) and parent_post.record.reply:
-                     logging.info(f"Skipping reply notification {notification.uri}: Parent post {parent_post.uri} is itself a reply. Avoiding reply-to-reply chain.")
-                     return # Exit processing, don't reply to replies-to-replies
-
-                 # If parent is by bot AND is not a reply, THEN check for existing bot replies to it
-                 logging.debug(f"Reply {notification.uri} is to an original bot post {parent_post.uri}. Checking for duplicates.")
+                 # If parent is by bot, THEN check for existing bot replies to it
+                 logging.debug(f"Reply {notification.uri} is to a bot post {parent_post.uri}. Checking for duplicates.")
                  parent_uri = parent_post.uri
                  try:
                      # Fetch the parent thread specifically to check its replies accurately
