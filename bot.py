@@ -226,49 +226,41 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         
         logging.debug(f"Generated full prompt for Gemini:\n{full_prompt_for_gemini}")
         
-        # Get response from Gemini (potentially image + text)
         gemini_response = None
         reply_text = None
         image_data_bytes = None
-        generated_alt_text = "Generated image" # Default alt text
+        generated_alt_text = "Generated image"
 
         try:
             logging.info(f"Sending context to Gemini ({GEMINI_MODEL_NAME})...")
-            # Assume generate_content handles multimodal prompts correctly
-            gemini_response = gemini_model.generate_content(full_prompt_for_gemini) # Use the new full_prompt_for_gemini
+            gemini_response = gemini_model.generate_content(full_prompt_for_gemini)
 
-            # Extract text part first
+            # Extract text part first - This try/except was problematic
             try:
-            reply_text = gemini_response.text
+                 reply_text = gemini_response.text
             except ValueError as ve: 
                  logging.error(f"Gemini text generation failed for {mentioned_post_uri} (ValueError): {ve}")
-            if hasattr(gemini_response, 'prompt_feedback') and gemini_response.prompt_feedback.block_reason:
-                logging.error(f"Gemini prompt blocked. Reason: {gemini_response.prompt_feedback.block_reason}")
-                 # Proceed only if we might get an image
+                 if hasattr(gemini_response, 'prompt_feedback') and gemini_response.prompt_feedback.block_reason:
+                     logging.error(f"Gemini prompt blocked. Reason: {gemini_response.prompt_feedback.block_reason}")
                  reply_text = "" # Allow empty text if image might exist
+            # No separate except needed here if the main one below covers general errors
             
-            # Extract image data if present
             if hasattr(gemini_response, 'parts'):
                 for part in gemini_response.parts:
-                    # Check for inline image data
                     if hasattr(part, 'inline_data') and part.inline_data and hasattr(part.inline_data, 'mime_type') and part.inline_data.mime_type.startswith('image/'):
                         if hasattr(part.inline_data, 'data') and isinstance(part.inline_data.data, bytes):
                              image_data_bytes = part.inline_data.data
                              logging.info(f"Received image data ({part.inline_data.mime_type}, {len(image_data_bytes)} bytes) from Gemini.")
-                             # TODO: Potentially extract alt text if Gemini provides it in another part or field
-                             break # Assume only one image for now
+                             break 
                         else:
                              logging.warning("Found image part in Gemini response, but 'data' attribute missing or not bytes.")
-                    # TODO: Potentially handle other image response types (e.g., function calls, URLs) if needed
+        except Exception as e: # This is the main except for the Gemini call
+            logging.error(f"Gemini API call or initial response processing failed for {mentioned_post_uri}: {e}", exc_info=True)
+            return 
 
-        except Exception as e:
-            logging.error(f"Gemini API call failed for {mentioned_post_uri}: {e}", exc_info=True)
-            return # Exit if Gemini call itself fails
-
-        # Check if we got *anything* back
         if not reply_text and not image_data_bytes:
              logging.info(f"Gemini returned no usable text or image for {mentioned_post_uri}. Skipping reply.")
-            return
+             return
 
         logging.info(f'Gemini reply text for {mentioned_post_uri}: "{reply_text[:50]}..."')
         if image_data_bytes:
@@ -431,19 +423,18 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         root_strong_ref = at_models.ComAtprotoRepoStrongRef.Main(uri=root_ref_input.uri, cid=root_ref_input.cid)
         reply_ref = at_models.AppBskyFeedPost.ReplyRef(root=root_strong_ref, parent=parent_strong_ref)
 
-        # Post the reply, including facets AND embed
-        try:
+        try: # This was missing its except clauses
             logging.info(f"Sending post in reply to {target_post.uri}...")
             bsky_client.send_post(
                 text=reply_text,
                 reply_to=reply_ref,
                 facets=facets if facets else None,
-                embed=embed_to_send # Add the embed here
+                embed=embed_to_send
             )
-        logging.info(f"Successfully posted reply to {mentioned_post_uri}")
-        except AtProtocolError as e:
+            logging.info(f"Successfully posted reply to {mentioned_post_uri}")
+        except AtProtocolError as e: # Added this except
              logging.error(f"Bluesky API error sending post reply to {mentioned_post_uri}: {e}")
-        except Exception as e:
+        except Exception as e: # Added this except
              logging.error(f"Unexpected error sending post reply to {mentioned_post_uri}: {e}", exc_info=True)
 
     except AtProtocolError as e:
@@ -544,7 +535,7 @@ def main_bot_loop():
                 # Check 2: Is it a mention OR a reply?
                 if notification.reason not in ['mention', 'reply']:
                     logging.debug(f" -> Skipping notification {notification.uri}: reason is not 'mention' or 'reply' ({notification.reason}).")
-                            continue
+                    continue # Corrected indentation here
 
                 # Check 3: Is it newer than the last processed one?
                 current_indexed_at = indexed_at_value # Use the found value
