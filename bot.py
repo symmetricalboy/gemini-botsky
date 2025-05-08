@@ -3,7 +3,7 @@ import time
 import logging
 from dotenv import load_dotenv
 from atproto import Client, models
-from atproto.exceptions import XrpcError
+from atproto.exceptions import AtProtocolError
 import google.generativeai as genai
 
 # Configure basic logging
@@ -38,7 +38,7 @@ def initialize_bluesky_client() -> Client | None:
         profile = client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
         logging.info(f"Successfully logged in to Bluesky as {profile.handle}")
         return client
-    except XrpcError as e:
+    except AtProtocolError as e:
         logging.error(f"Bluesky login failed: {e}")
         return None
     except Exception as e:
@@ -184,7 +184,7 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
         bsky_client.send_post(text=reply_text, reply_to=reply_ref)
         logging.info(f"Successfully posted reply to {mentioned_post_uri}")
 
-    except XrpcError as e:
+    except AtProtocolError as e:
         logging.error(f"Bluesky API error while processing mention {mentioned_post_uri}: {e}")
     except Exception as e:
         logging.error(f"Unexpected error while processing mention {mentioned_post_uri}: {e}", exc_info=True)
@@ -269,8 +269,13 @@ def main_bot_loop():
             else:
                 logging.debug(f"No new, unread mentions found. Current last processed ctime: {last_processed_mention_ctime}")
 
-        except XrpcError as e:
-            if e.response and e.response.status_code == 401: # Unauthorized
+        except AtProtocolError as e:
+            # Attempt to access e.response and e.response.status_code carefully
+            status_code = None
+            if hasattr(e, 'response') and e.response and hasattr(e.response, 'status_code'):
+                status_code = e.response.status_code
+            
+            if status_code == 401: # Unauthorized
                  logging.error(f"Bluesky authentication error: {e}. Attempting to re-login...")
                  bsky_client = initialize_bluesky_client()
                  if not bsky_client:
