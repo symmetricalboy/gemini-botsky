@@ -54,7 +54,7 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash-latest",
+            model_name="gemini-2.0-flash",
             system_instruction=BOT_SYSTEM_INSTRUCTION,
             safety_settings=[ # Adjust safety settings as needed
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -63,7 +63,7 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
             ]
         )
-        logging.info("Successfully initialized Gemini model.")
+        logging.info("Successfully initialized Gemini model (gemini-2.0-flash).")
         return model
     except Exception as e:
         logging.error(f"Failed to initialize Gemini model: {e}")
