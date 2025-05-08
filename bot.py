@@ -8,6 +8,8 @@ import google.generativeai as genai
 
 # Import the specific Params model
 from atproto_client.models.app.bsky.notification.list_notifications import Params as ListNotificationsParams
+# Import the specific Params model for get_post_thread
+from atproto_client.models.app.bsky.feed.get_post_thread import Params as GetPostThreadParams
 
 # Configure basic logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -127,7 +129,11 @@ def process_mention(notification: models.AppBskyNotificationListNotifications.No
     try:
         # Fetch the thread containing the mention
         # The URI in the notification is for the post that *is* the mention or *contains* the mention.
-        thread_view_response = bsky_client.app.bsky.feed.get_post_thread(uri=mentioned_post_uri, depth=MAX_THREAD_DEPTH_FOR_CONTEXT)
+        # thread_view_response = bsky_client.app.bsky.feed.get_post_thread(uri=mentioned_post_uri, depth=MAX_THREAD_DEPTH_FOR_CONTEXT) # Old way
+        
+        # Use explicit Params object
+        params = GetPostThreadParams(uri=mentioned_post_uri, depth=MAX_THREAD_DEPTH_FOR_CONTEXT)
+        thread_view_response = bsky_client.app.bsky.feed.get_post_thread(params=params)
         
         if not isinstance(thread_view_response.thread, models.AppBskyFeedDefs.ThreadViewPost):
             logging.warning(f"Could not fetch thread or thread is not a ThreadViewPost for {mentioned_post_uri}. Type: {type(thread_view_response.thread)}")
