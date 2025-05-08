@@ -263,34 +263,41 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 try:
                     get_parent_params = GetPostsParams(uris=[parent_ref.uri])
                     parent_post_response = bsky_client.app.bsky.feed.get_posts(params=get_parent_params)
+                    
+                    # Add detailed logging about the parent post response
+                    if parent_post_response:
+                        logging.info(f"[Reply Check] Parent post response received. Has posts: {bool(parent_post_response.posts)}, Posts count: {len(parent_post_response.posts) if parent_post_response.posts else 0}")
+                    
                     if parent_post_response and parent_post_response.posts and len(parent_post_response.posts) == 1:
                         immediate_parent_post = parent_post_response.posts[0]
-                        logging.info(f"[Reply Check] Fetched immediate parent post. Author: {immediate_parent_post.author.handle}")
+                        logging.info(f"[Reply Check] Fetched immediate parent post. Author: {immediate_parent_post.author.handle}, URI: {immediate_parent_post.uri}")
 
                         # **REVISED LOGIC**: Only proceed if the immediate parent IS the bot.
                         if immediate_parent_post.author.handle == BLUESKY_HANDLE:
-                            logging.info(f"[Reply Check] Immediate parent is the bot. Checking for duplicate replies under {target_post.uri}...")
+                            logging.info(f"[Reply Check] ✓ Immediate parent is the bot. Continue processing.")
+                            logging.info(f"[Reply Check] Checking for duplicate replies under {target_post.uri}...")
                             # Check for existing replies by the bot under the *triggering* post (target_post)
                             if thread_view_of_mentioned_post.replies:
+                                 logging.info(f"[Reply Check] Target post has {len(thread_view_of_mentioned_post.replies)} replies to check for duplicates.")
                                  for reply_to_users_reply in thread_view_of_mentioned_post.replies:
                                     if reply_to_users_reply.post and reply_to_users_reply.post.author and \
                                        reply_to_users_reply.post.author.handle == BLUESKY_HANDLE:
                                         logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_users_reply.post.uri} under user's reply {target_post.uri}. Skipping.")
                                         return
                             # If no duplicate found, fall through to generate context and reply...
-                            logging.info(f"[Reply Check] No duplicate bot reply found under {target_post.uri}. Proceeding.")
+                            logging.info(f"[Reply Check] ✓ No duplicate bot reply found under {target_post.uri}. Proceeding.")
                         else:
                             # Parent is another user, ignore this reply.
-                            logging.info(f"[IGNORE USER-TO-USER REPLY] Notification {notification.uri} is a reply to another user ({immediate_parent_post.author.handle}), not the bot. Ignoring.")
+                            logging.info(f"[IGNORE USER-TO-USER REPLY] ✗ Notification {notification.uri} is a reply to another user ({immediate_parent_post.author.handle}), not the bot. Ignoring.")
                             return
                     else:
-                        logging.warning(f"[Reply Check] Failed to fetch or parse immediate parent post {parent_ref.uri}. Cannot determine parent author. Skipping reply.")
+                        logging.warning(f"[Reply Check] ✗ Failed to fetch or parse immediate parent post {parent_ref.uri}. Cannot determine parent author. Skipping reply.")
                         return # Skip if we can't verify parent
                 except Exception as e:
-                    logging.error(f"[Reply Check] Error fetching immediate parent post {parent_ref.uri}: {e}", exc_info=True)
+                    logging.error(f"[Reply Check] ✗ Error fetching immediate parent post {parent_ref.uri}: {e}", exc_info=True)
                     return # Skip if fetch fails
             else:
-                 logging.warning(f"[Reply Check] Notification {notification.uri} is a reply, but couldn't get parent ref from record. Skipping reply.")
+                 logging.warning(f"[Reply Check] ✗ Notification {notification.uri} is a reply, but couldn't get parent ref from record. Skipping reply.")
                  return # Skip if structure is unexpected
         
         else: # Should not happen based on main loop filter, but good practice
@@ -298,9 +305,10 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             return
 
         # --- Generate context and reply (if not returned/skipped above) ---
+        logging.info(f"✓ Proceeding to content generation for {notification.uri}")
         context_string = format_thread_for_gemini(thread_view_of_mentioned_post, BLUESKY_HANDLE)
         if not context_string:
-            logging.warning(f"Failed to generate context string for {mentioned_post_uri}. Skipping reply.")
+            logging.warning(f"✗ Failed to generate context string for {mentioned_post_uri}. Skipping reply.")
             return
 
         dynamic_instruction = (
@@ -640,10 +648,15 @@ def main_bot_loop():
 
             if response and response.notifications:
                 latest_notification_indexed_at_in_batch = None # To track for updateSeen
+                
+                logging.info(f"Fetched {len(response.notifications)} notifications.")
 
                 # Sort by indexedAt to process older unread notifications first,
                 # and to correctly find the latest for updateSeen
                 sorted_notifications = sorted(response.notifications, key=lambda n: n.indexed_at)
+                
+                unread_count = sum(1 for n in sorted_notifications if not n.is_read)
+                logging.info(f"Found {unread_count} unread notifications to process.")
 
                 for notification in sorted_notifications:
                     # Update latest_notification_indexed_at_in_batch with the timestamp of every notification seen in this batch
@@ -665,12 +678,15 @@ def main_bot_loop():
                     if notification.author.handle == BLUESKY_HANDLE:
                         logging.info(f"Skipping notification {notification.uri} from bot ({BLUESKY_HANDLE}) itself.")
                         continue
+                    
+                    # Log the notification we're about to process
+                    logging.info(f"Processing notification: type={notification.reason}, from={notification.author.handle}, at={notification.indexed_at}")
                         
                     if notification.reason in ['mention', 'reply']:
                         # Pass the gemini_model directly
                         process_mention(notification, gemini_model) 
-                    # else:
-                        # logging.debug(f"Skipping notification {notification.uri}: Reason '{notification.reason}' not 'mention' or 'reply'.")
+                    else:
+                        logging.debug(f"Skipping notification {notification.uri}: Reason '{notification.reason}' not 'mention' or 'reply'.")
 
                 # After processing all notifications in the batch, update seen status on server
                 if latest_notification_indexed_at_in_batch:
