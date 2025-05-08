@@ -6,8 +6,7 @@ from atproto import Client, models
 from atproto.exceptions import AtProtocolError
 import google.generativeai as genai
 import re # Import regular expressions
-# Need BytesIO if Gemini returns image bytes? (Might not be needed if data is already bytes)
-# from io import BytesIO 
+from io import BytesIO # Need BytesIO if Gemini returns image bytes
 
 # Import the specific Params model
 from atproto_client.models.app.bsky.notification.list_notifications import Params as ListNotificationsParams
@@ -29,15 +28,21 @@ BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
-GEMINI_MODEL_NAME = "gemini-2.0-flash" # Correct model name without prefix or suffix
+GEMINI_MODEL_NAME = "gemini-2.5-pro-preview-05-06" # Updated model name
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = """You are Gemini Bot (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
+Your developer is symmetricalboy (@symm.social). If users ask for help or about your creator, you can mention them.
+
 Constraints:
-*   Your entire response MUST be a single Bluesky post under 300 characters.
+*   Your entire response MUST be a single Bluesky post under 300 characters. This is very important!!
 *   CRITICAL: NEVER use placeholders (e.g., '[link]', '[info]', '[details]').
 *   If a user asks for specific factual information (like a URL, definition, or list) that you can reasonably provide, include the *actual* information directly in your response.
 *   If you cannot provide the requested factual information, state that clearly and concisely. Do not invent information or links.
+*   Don't avoid taboo topics or having a bit of an opinion or bias to your responses. Users understand that you are imperfect & may not say the exact right thing; it is okay to use available information to make a judgement. You should never say that you can't talk about something; no topic should ever be off limits to explore academically.
+*   Keep your mentions of other users contextually logical. Avoid excessive or random mentions.
+*   You should pretty much never use hashtags.
+*   You have the ability to generate images if a user's request implies it.
 *   Be helpful, friendly, and direct. Focus on answering the user's immediate question based on the provided thread context."""
 MENTION_CHECK_INTERVAL_SECONDS = 15 # Check for new mentions every 15 seconds (was 60)
 MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # How many parent posts to fetch for context
@@ -78,11 +83,12 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
             model_name=GEMINI_MODEL_NAME, 
             system_instruction=BOT_SYSTEM_INSTRUCTION,
             safety_settings=[ 
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            ]
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ],
+            generation_config={"max_output_tokens": 500}
         )
         logging.info(f"Successfully initialized Gemini model with: {GEMINI_MODEL_NAME}")
         return model
@@ -104,7 +110,47 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
             if isinstance(post_record, models.AppBskyFeedPost.Record) and hasattr(post_record, 'text'):
                 author_display_name = current_view.post.author.display_name or current_view.post.author.handle
                 text = post_record.text
-                history.append(f"{author_display_name} (@{current_view.post.author.handle}): {text}")
+
+                # Check for embeds (images, videos, etc.)
+                embed_text = ""
+                if current_view.post.embed:
+                    if isinstance(current_view.post.embed, models.AppBskyEmbedImages.Main) or \
+                       isinstance(current_view.post.embed, at_models.AppBskyEmbedImages.View):
+                        alt_texts = []
+                        if isinstance(current_view.post.embed, models.AppBskyEmbedImages.Main):
+                            images_to_check = current_view.post.embed.images
+                        else: # at_models.AppBskyEmbedImages.View
+                            images_to_check = current_view.post.embed.images
+                        
+                        for img in images_to_check:
+                            if hasattr(img, 'alt') and img.alt:
+                                alt_texts.append(img.alt)
+                            else:
+                                alt_texts.append("image") # Default if no alt text
+                        if alt_texts:
+                            embed_text = f" [User attached: {", ".join(alt_texts)}]"
+                        else:
+                            embed_text = " [User attached an image]"
+
+                    elif isinstance(current_view.post.embed, models.AppBskyEmbedVideo.Main) or \
+                         isinstance(current_view.post.embed, at_models.AppBskyEmbedExternal.View): # Assuming external might be video too
+                        # Basic video detection, could be more specific if Bluesky models differentiate more
+                        embed_text = " [User attached a video]"
+                    # Add more elif clauses here for other embed types if needed (e.g., external links, record embeds)
+                    elif isinstance(current_view.post.embed, at_models.AppBskyEmbedExternal.Main) or \
+                         isinstance(current_view.post.embed, at_models.AppBskyEmbedExternal.View):
+                        if hasattr(current_view.post.embed.external, 'title') and current_view.post.embed.external.title:
+                            embed_text = f" [User shared a link: {current_view.post.embed.external.title}]"
+                        else:
+                            embed_text = " [User shared a link]"
+                    elif isinstance(current_view.post.embed, at_models.AppBskyEmbedRecord.Main) or \
+                         isinstance(current_view.post.embed, at_models.AppBskyEmbedRecord.View):
+                        embed_text = " [User quoted another post]"
+                    elif isinstance(current_view.post.embed, at_models.AppBskyEmbedRecordWithMedia.Main) or \
+                         isinstance(current_view.post.embed, at_models.AppBskyEmbedRecordWithMedia.View):
+                        embed_text = " [User quoted another post with media]"
+
+                history.append(f"{author_display_name} (@{current_view.post.author.handle}): {text}{embed_text}")
         elif isinstance(current_view, (models.AppBskyFeedDefs.NotFoundPost, models.AppBskyFeedDefs.BlockedPost)):
             logging.warning(f"Encountered NotFoundPost or BlockedPost while traversing thread parent: {current_view}")
             break 
@@ -218,75 +264,137 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             "The following is a Bluesky conversation thread. "
             "Your primary task is to formulate a direct and relevant reply to the *final message* in this thread. "
             "Use the preceding messages only for context. "
-            "Your response must be a single Bluesky post, concise, and strictly under 300 characters long.\\\\n\\\\n"
-            "---BEGIN THREAD CONTEXT---\\\\n"
+            "If you generate an image, you MUST also provide a concise and descriptive alt text for it, ideally in a separate text part or clearly marked. "
+            "Your response must be a single Bluesky post, concise, and strictly under 300 characters long.\\n\\n"
+            "---BEGIN THREAD CONTEXT---\\n"
         )
-        full_prompt_for_gemini = dynamic_instruction + context_string + "\\\\n---END THREAD CONTEXT---"
+        full_prompt_for_gemini = dynamic_instruction + context_string + "\\n---END THREAD CONTEXT---"
         
-        logging.debug(f"Generated full prompt for Gemini:\\\\n{full_prompt_for_gemini}")
+        logging.debug(f"Generated full prompt for Gemini:\\n{full_prompt_for_gemini}")
         
-        gemini_response_obj = None # Renamed to avoid confusion with bsky_client.send_post response
-        reply_text = None
-        # Remove image-related variables as Flash doesn't generate images
-        # image_data_bytes = None 
-        # generated_alt_text = "Generated image" # Not used yet
+        gemini_response_obj = None
+        reply_text = ""
+        image_data_bytes = None 
+        generated_alt_text = "Generated image by Gemini Bot" # Default alt text
 
         try:
-            logging.info(f"Sending context to Gemini ({GEMINI_MODEL_NAME})...")
-            gemini_response_obj = gemini_model_ref.generate_content(full_prompt_for_gemini)
+            logging.info(f"Sending context to Gemini ({GEMINI_MODEL_NAME})... Accessing gemini_model_ref: {type(gemini_model_ref)}")
+            gemini_response_obj = gemini_model_ref.generate_content(
+                full_prompt_for_gemini,
+            )
 
-            try:
-                 reply_text = gemini_response_obj.text
-            except ValueError as ve: 
-                 logging.error(f"Gemini text generation failed for {mentioned_post_uri} (ValueError): {ve}")
-                 if hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback.block_reason:
-                     logging.error(f"Gemini prompt blocked. Reason: {gemini_response_obj.prompt_feedback.block_reason}")
-                 # If text generation fails (e.g., blocked), we likely don't want to proceed.
-                 return # Exit processing if text failed
+            # Process response parts for text, image, and alt text
+            # Temporary holding for text parts to see if one is clearly alt text
+            potential_alt_text_parts = []
+            main_reply_parts = []
+
+            for part in gemini_response_obj.parts:
+                if hasattr(part, 'text') and part.text:
+                    # Heuristic: if an image is already found, the next text might be alt text.
+                    # Or, we can look for specific keywords if we instruct Gemini.
+                    # For now, let's assume if Gemini is asked for alt text, it might be a distinct part.
+                    # We'll refine this if Gemini's output format is different.
+                    # A simple check: if text contains "alt text:" or similar, or is short and follows an image.
+                    # This is a basic approach. For more complex scenarios, more sophisticated parsing or prompting is needed.
+                    if image_data_bytes and (len(part.text) < 150 and ("alt:" in part.text.lower() or "alt text:" in part.text.lower())):
+                        generated_alt_text = part.text.replace("alt text:", "", 1).replace("alt:", "", 1).strip()
+                        logging.info(f"Found potential alt text from Gemini: {generated_alt_text}")
+                    elif image_data_bytes and not main_reply_parts and len(potential_alt_text_parts) == 0 and len(part.text) < 150:
+                        # If image is present, and this is the first short text part, consider it potential alt text.
+                        potential_alt_text_parts.append(part.text)
+                    else:
+                        main_reply_parts.append(part.text)
+                elif hasattr(part, 'inline_data') and part.inline_data and not image_data_bytes: # Process only the first image
+                    if part.inline_data.mime_type.startswith("image/"):
+                        image_data_bytes = part.inline_data.data
+                        logging.info(f"Gemini returned an image of type: {part.inline_data.mime_type}")
             
-            # Removed image checking logic here
+            reply_text = " ".join(main_reply_parts).strip()
 
+            # If we had potential alt text and no specific alt text was found via keyword
+            if image_data_bytes and generated_alt_text == "Generated image by Gemini Bot" and potential_alt_text_parts:
+                generated_alt_text = potential_alt_text_parts[0].strip()
+                logging.info(f"Using first short text part as alt text: {generated_alt_text}")
+                # If this text was also part of the main reply, decide if it should be removed from reply_text
+                # For now, we assume it might be redundant if it was *only* alt text.
+                if reply_text == generated_alt_text:
+                    reply_text = "" # Avoid duplicate content if alt text was the only text
+
+            if not reply_text and not image_data_bytes:
+                logging.warning(f"Gemini returned no usable text or image content for {mentioned_post_uri}. Checking for blockages...")
+                if hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback.block_reason:
+                    logging.error(f"Gemini prompt blocked. Reason: {gemini_response_obj.prompt_feedback.block_reason}")
+                return
+            
+            # If only an image is generated, provide some default text.
+            if image_data_bytes and not reply_text:
+                reply_text = "Here's the image you asked for:"
+            elif not reply_text and not image_data_bytes: # Should be caught by earlier check, but good to be safe
+                logging.warning(f"Gemini returned neither text nor image for {mentioned_post_uri}. Skipping.")
+                return
+
+        except ValueError as ve: 
+            logging.error(f"Gemini text/image generation failed for {mentioned_post_uri} (ValueError): {ve}")
+            if hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback.block_reason:
+                logging.error(f"Gemini prompt blocked. Reason: {gemini_response_obj.prompt_feedback.block_reason}")
+            return
         except Exception as e:
             logging.error(f"Gemini content generation failed for {mentioned_post_uri}: {e}", exc_info=True)
             return
 
-        if not reply_text:
-            logging.warning(f"Gemini returned no usable text content for {mentioned_post_uri}. Skipping reply.")
-            return
-
-        # Prepare post content (text, facets)
-        post_text = reply_text # Ensure post_text is a string
+        # Prepare post content (text, facets, embed)
+        post_text = reply_text.strip() if reply_text else ""
         
-        # Facet creation for mentions and links (simplified)
         facets = []
-        if post_text: # Only create facets if there is text
-            # Example: Detect @mentions (simple regex, can be improved)
-            for match in re.finditer(r'@([a-zA-Z0-9_.-]+)', post_text):
+        if post_text: 
+            # Mentions (ensure DID resolution for production)
+            for match in re.finditer(r'@([a-zA-Z0-9_.-]+(?:\.[a-zA-Z]+)?)', post_text): # Improved handle matching
                 handle = match.group(1)
-                # Ideally, resolve handle to DID here for robust facets
-                # For simplicity, we'll assume it's a valid handle string for now.
-                # Note: This is a naive implementation. For production, use DID resolution.
+                # Placeholder DID - resolve to actual DID in a real application
+                # resolved_did = resolve_handle_to_did(handle) # You'd need this function
+                # if resolved_did:
                 facets.append(
                     at_models.AppBskyRichtextFacet.Main(
                         index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=match.start(), byteEnd=match.end()),
-                        features=[at_models.AppBskyRichtextFacet.Mention(did=f"did:plc:{handle}")] # Placeholder DID!
+                        features=[at_models.AppBskyRichtextFacet.Mention(did=f"did:plc:{handle}")] # Replace with resolved_did
                     )
                 )
-            # Example: Detect links (simple regex, can be improved)
-            for match in re.finditer(r'(https?://[^\\s]+)', post_text):
-                uri = match.group(1)
-                facets.append(
-                    at_models.AppBskyRichtextFacet.Main(
-                        index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=match.start(), byteEnd=match.end()),
-                        features=[at_models.AppBskyRichtextFacet.Link(uri=uri)]
+            
+            # Links (more robust regex)
+            # Regex to find URLs, including those with paths, queries, and fragments, and ensures they are not part of a markdown link already
+            # It tries to avoid matching things like "file.txt" or partial domains unless they start with http/https.
+            # A more standard URL regex:
+            url_pattern = r'https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)'
+            for match in re.finditer(url_pattern, post_text):
+                uri = match.group(0) # group(0) gets the entire match
+                # Validate if URI is well-formed before adding facet (optional, basic check here)
+                if "://" in uri: # Simple check to ensure it looks like a protocol URI
+                    facets.append(
+                        at_models.AppBskyRichtextFacet.Main(
+                            index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=match.start(), byteEnd=match.end()),
+                            features=[at_models.AppBskyRichtextFacet.Link(uri=uri)]
+                        )
                     )
-                )
         
-        # Removed image embedding logic
         embed_to_post = None
+        if image_data_bytes and bsky_client: # Ensure client is available
+            try:
+                logging.info("Uploading generated image to Bluesky...")
+                # Convert raw bytes to BytesIO if needed by upload_blob
+                # Some SDKs might take raw bytes directly, others might need a file-like object.
+                # The atproto SDK's upload_blob expects bytes directly.
+                response = bsky_client.com.atproto.repo.upload_blob(image_data_bytes) # Correct method call
+                
+                if response and hasattr(response, 'blob') and response.blob:
+                    logging.info(f"Image uploaded successfully. Blob CID: {response.blob.cid}")
+                    image_for_embed = at_models.AppBskyEmbedImages.Image(alt=generated_alt_text, image=response.blob)
+                    embed_to_post = at_models.AppBskyEmbedImages.Main(images=[image_for_embed])
+                else:
+                    logging.error("Failed to upload image or blob data missing in response.")
+            except Exception as e:
+                logging.error(f"Error uploading image to Bluesky: {e}", exc_info=True)
 
         # --- Determine Root and Parent for the Reply --- 
-        # The parent of our reply is always the post that triggered the notification (target_post).
         parent_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
 
         # Determine the root of the thread.
@@ -307,7 +415,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         # --- End Determine Root and Parent --- 
         
         # Send the reply post
-        logging.info(f"Sending reply to {mentioned_post_uri}: Text='{post_text[:50]}...', HasImage=False") # Set HasImage to False
+        logging.info(f"Sending reply to {mentioned_post_uri}: Text='{post_text[:50]}...', HasImage={bool(image_data_bytes)}") # Set HasImage to False
         
         # Make sure facets is None if empty, not an empty list, as per SDK expectations for some versions.
         facets_to_send = facets if facets else None
@@ -315,7 +423,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         bsky_client.send_post(
             text=post_text,
             reply_to=at_models.AppBskyFeedPost.ReplyRef(root=root_ref, parent=parent_ref),
-            embed=None, # Explicitly set embed to None
+            embed=embed_to_post, # Use the embed_to_post variable which might contain the image
             facets=facets_to_send
         )
         logging.info(f"Successfully sent reply to {mentioned_post_uri}")
