@@ -148,8 +148,31 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             
         # --- Updated Reply Handling & Duplicate Check ---
         if notification.reason == 'reply':
-            # Check for existing replies from the bot to this specific trigger post.
-            # This prevents the bot sending multiple replies if it processes the same notification again quickly.
+            post_record = target_post.record
+            # First, check if the root of this reply thread is a post made by the bot.
+            # If so, ignore the entire thread to prevent loops.
+            if isinstance(post_record, at_models.AppBskyFeedPost.Record) and post_record.reply and post_record.reply.root:
+                root_ref = post_record.reply.root # This is a StrongRef (uri, cid)
+                logging.info(f"[Reply Chain Check] Notification for {target_post.uri}. Thread root URI: {root_ref.uri}. Fetching root...")
+                try:
+                    get_root_params = GetPostsParams(uris=[root_ref.uri])
+                    root_post_response = bsky_client.app.bsky.feed.get_posts(params=get_root_params)
+                    if root_post_response and root_post_response.posts and len(root_post_response.posts) == 1:
+                        root_post = root_post_response.posts[0]
+                        logging.info(f"[Reply Chain Check] Fetched root post. Author: {root_post.author.handle}")
+                        # **REVISED LOGIC**: If the *root* post is by the bot, IGNORE the reply.
+                        if root_post.author.handle == BLUESKY_HANDLE:
+                            logging.info(f"[IGNORE REPLY CHAIN] Notification {notification.uri} is in a thread rooted by the bot ({root_post.uri}). Ignoring.")
+                            return
+                    else:
+                        logging.warning(f"[Reply Chain Check] Failed to fetch or parse root post {root_ref.uri}. Proceeding without root author check.")
+                except Exception as e:
+                    logging.error(f"[Reply Chain Check] Error fetching root post {root_ref.uri}: {e}", exc_info=True)
+                    # Proceed cautiously if root check fails
+            else:
+                 logging.warning(f"[Reply Chain Check] Notification {notification.uri} is a reply, but couldn't get root ref from record. Proceeding.")
+
+            # If the root check passed (or failed), then check for direct duplicate replies to the *current* post.
             if thread_view_of_mentioned_post.replies: # Check replies under the user's triggering reply (target_post)
                 for reply_to_users_reply in thread_view_of_mentioned_post.replies:
                     if reply_to_users_reply.post and reply_to_users_reply.post.author and \
