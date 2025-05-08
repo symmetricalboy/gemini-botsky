@@ -146,52 +146,63 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             logging.warning(f"Thread view for {mentioned_post_uri} does not contain a post.")
             return
             
-        # --- Updated Reply Handling & Duplicate Check ---
-        if notification.reason == 'reply':
-            post_record = target_post.record
-            # First, check if the root of this reply thread is a post made by the bot.
-            # If so, ignore the entire thread to prevent loops.
-            if isinstance(post_record, at_models.AppBskyFeedPost.Record) and post_record.reply and post_record.reply.root:
-                root_ref = post_record.reply.root # This is a StrongRef (uri, cid)
-                logging.info(f"[Reply Chain Check] Notification for {target_post.uri}. Thread root URI: {root_ref.uri}. Fetching root...")
-                try:
-                    get_root_params = GetPostsParams(uris=[root_ref.uri])
-                    root_post_response = bsky_client.app.bsky.feed.get_posts(params=get_root_params)
-                    if root_post_response and root_post_response.posts and len(root_post_response.posts) == 1:
-                        root_post = root_post_response.posts[0]
-                        logging.info(f"[Reply Chain Check] Fetched root post. Author: {root_post.author.handle}")
-                        # **REVISED LOGIC**: If the *root* post is by the bot, IGNORE the reply.
-                        if root_post.author.handle == BLUESKY_HANDLE:
-                            logging.info(f"[IGNORE REPLY CHAIN] Notification {notification.uri} is in a thread rooted by the bot ({root_post.uri}). Ignoring.")
-                            return
-                    else:
-                        logging.warning(f"[Reply Chain Check] Failed to fetch or parse root post {root_ref.uri}. Proceeding without root author check.")
-                except Exception as e:
-                    logging.error(f"[Reply Chain Check] Error fetching root post {root_ref.uri}: {e}", exc_info=True)
-                    # Proceed cautiously if root check fails
-            else:
-                 logging.warning(f"[Reply Chain Check] Notification {notification.uri} is a reply, but couldn't get root ref from record. Proceeding.")
-
-            # If the root check passed (or failed), then check for direct duplicate replies to the *current* post.
-            if thread_view_of_mentioned_post.replies: # Check replies under the user's triggering reply (target_post)
-                for reply_to_users_reply in thread_view_of_mentioned_post.replies:
-                    if reply_to_users_reply.post and reply_to_users_reply.post.author and \
-                        reply_to_users_reply.post.author.handle == BLUESKY_HANDLE:
-                        logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_users_reply.post.uri} to user's reply {target_post.uri}. Skipping.")
-                        return
-            # Note: We removed the logic that explicitly ignored replies directed at the bot's posts.
-            # The bot will now reply once to a direct reply, relying on the check above 
-            # and the main loop's is_read/processed_uris_this_run checks to prevent further looping.
-
-        elif notification.reason == 'mention':
-            # Check replies to the post containing the mention (target_post)
+        # --- Reason-Specific Logic ---
+        if notification.reason == 'mention':
+            logging.info(f"[Mention Check] Processing mention in {target_post.uri}")
+            # Check for existing replies by the bot under the mentioned post (target_post)
             if thread_view_of_mentioned_post.replies:
-                for reply_in_thread in thread_view_of_mentioned_post.replies:
+                 for reply_in_thread in thread_view_of_mentioned_post.replies:
                     if reply_in_thread.post and reply_in_thread.post.author and reply_in_thread.post.author.handle == BLUESKY_HANDLE:
                         logging.info(f"[DUPE CHECK MENTION] Found pre-existing bot reply {reply_in_thread.post.uri} to mentioned post {target_post.uri}. Skipping.")
                         return
-        # --- End: DUPLICATE and SELF-REPLY CHECKS ---
+            # If no duplicate found, fall through to generate context and reply...
+            logging.info(f"[Mention Check] No duplicate bot reply found for mention {target_post.uri}. Proceeding.")
 
+        elif notification.reason == 'reply':
+            logging.info(f"[Reply Check] Processing reply notification for {target_post.uri}")
+            post_record = target_post.record
+            # Check if the target post is a valid reply with parent info
+            if isinstance(post_record, at_models.AppBskyFeedPost.Record) and post_record.reply and post_record.reply.parent:
+                parent_ref = post_record.reply.parent
+                logging.info(f"[Reply Check] Post {target_post.uri} replies to parent URI: {parent_ref.uri}. Fetching parent...")
+                try:
+                    get_parent_params = GetPostsParams(uris=[parent_ref.uri])
+                    parent_post_response = bsky_client.app.bsky.feed.get_posts(params=get_parent_params)
+                    if parent_post_response and parent_post_response.posts and len(parent_post_response.posts) == 1:
+                        immediate_parent_post = parent_post_response.posts[0]
+                        logging.info(f"[Reply Check] Fetched immediate parent post. Author: {immediate_parent_post.author.handle}")
+
+                        # **REVISED LOGIC**: Only proceed if the immediate parent IS the bot.
+                        if immediate_parent_post.author.handle == BLUESKY_HANDLE:
+                            logging.info(f"[Reply Check] Immediate parent is the bot. Checking for duplicate replies under {target_post.uri}...")
+                            # Check for existing replies by the bot under the *triggering* post (target_post)
+                            if thread_view_of_mentioned_post.replies:
+                                 for reply_to_users_reply in thread_view_of_mentioned_post.replies:
+                                    if reply_to_users_reply.post and reply_to_users_reply.post.author and \
+                                       reply_to_users_reply.post.author.handle == BLUESKY_HANDLE:
+                                        logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_users_reply.post.uri} under user's reply {target_post.uri}. Skipping.")
+                                        return
+                            # If no duplicate found, fall through to generate context and reply...
+                            logging.info(f"[Reply Check] No duplicate bot reply found under {target_post.uri}. Proceeding.")
+                        else:
+                            # Parent is another user, ignore this reply.
+                            logging.info(f"[IGNORE USER-TO-USER REPLY] Notification {notification.uri} is a reply to another user ({immediate_parent_post.author.handle}), not the bot. Ignoring.")
+                            return
+                    else:
+                        logging.warning(f"[Reply Check] Failed to fetch or parse immediate parent post {parent_ref.uri}. Cannot determine parent author. Skipping reply.")
+                        return # Skip if we can't verify parent
+                except Exception as e:
+                    logging.error(f"[Reply Check] Error fetching immediate parent post {parent_ref.uri}: {e}", exc_info=True)
+                    return # Skip if fetch fails
+            else:
+                 logging.warning(f"[Reply Check] Notification {notification.uri} is a reply, but couldn't get parent ref from record. Skipping reply.")
+                 return # Skip if structure is unexpected
+        
+        else: # Should not happen based on main loop filter, but good practice
+            logging.warning(f"Skipping notification {notification.uri} with unexpected reason: {notification.reason}")
+            return
+
+        # --- Generate context and reply (if not returned/skipped above) ---
         context_string = format_thread_for_gemini(thread_view_of_mentioned_post, BLUESKY_HANDLE)
         if not context_string:
             logging.warning(f"Failed to generate context string for {mentioned_post_uri}. Skipping reply.")
