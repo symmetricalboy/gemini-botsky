@@ -369,7 +369,7 @@ def main_bot_loop():
                         if latest_notification_indexed_at_in_batch is None or notification.indexed_at > latest_notification_indexed_at_in_batch:
                             latest_notification_indexed_at_in_batch = notification.indexed_at
                     
-                    if notification.isRead:
+                    if notification.is_read:
                         logging.debug(f"Skipping already read notification: {notification.uri}")
                         continue
 
