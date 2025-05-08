@@ -360,14 +360,14 @@ def main_bot_loop():
 
                 # Sort by indexedAt to process older unread notifications first,
                 # and to correctly find the latest for updateSeen
-                sorted_notifications = sorted(response.notifications, key=lambda n: n.indexedAt)
+                sorted_notifications = sorted(response.notifications, key=lambda n: n.indexed_at)
 
                 for notification in sorted_notifications:
                     # Update latest_notification_indexed_at_in_batch with the timestamp of every notification seen in this batch
                     # This ensures updateSeen covers everything fetched, even if not processed (e.g. already read, or not a mention)
-                    if notification.indexedAt:
-                        if latest_notification_indexed_at_in_batch is None or notification.indexedAt > latest_notification_indexed_at_in_batch:
-                            latest_notification_indexed_at_in_batch = notification.indexedAt
+                    if notification.indexed_at:
+                        if latest_notification_indexed_at_in_batch is None or notification.indexed_at > latest_notification_indexed_at_in_batch:
+                            latest_notification_indexed_at_in_batch = notification.indexed_at
                     
                     if notification.isRead:
                         logging.debug(f"Skipping already read notification: {notification.uri}")
