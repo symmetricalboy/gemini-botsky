@@ -393,87 +393,78 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 try:
                     logging.info(f"Sending prompt to Imagen model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
                     
-                    # For Gemini image generation models, we need to specifically use the right configuration
-                    # Using the response_modalities approach from the official docs
+                    # Gemini expects a properly formatted Content object for image generation
+                    # Following the official documentation format
                     imagen_response_obj = imagen_model.generate_content(
-                        image_prompt_for_imagen,
-                        # Making sure to use types.GenerateContentConfig correctly
+                        contents=[
+                            {
+                                "role": "user",
+                                "parts": [{"text": image_prompt_for_imagen}]
+                            }
+                        ],
                         generation_config={
+                            "temperature": 0.4,
+                            "response_mime_type": "image/png",
                             "response_modalities": ["TEXT", "IMAGE"]
                         }
                     )
                     
-                    # Try to extract image bytes - this is an assumption on response structure
-                    # It's common for image models to return parts, or a direct image attribute.
-                    if imagen_response_obj and hasattr(imagen_response_obj, 'parts') and imagen_response_obj.parts:
-                        for part in imagen_response_obj.parts:
-                            if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                                # The data is likely base64-encoded, so we need to convert it to bytes
-                                try:
-                                    image_data_bytes = base64.b64decode(part.inline_data.data)
-                                    # Validate image size - real images should be at least a few KB
-                                    if len(image_data_bytes) < 1000:  # Minimum 1KB for a reasonable image
-                                        logging.warning(f"Image data too small ({len(image_data_bytes)} bytes). May be invalid.")
-                                        if len(image_data_bytes) < 100:  # Extremely small images are definitely invalid
-                                            logging.error("Image data too small to be valid. Skipping image.")
-                                            image_data_bytes = None
-                                            continue
-                                    logging.info(f"Imagen Attempt {imagen_attempt + 1}: Imagen returned an image of type: {part.inline_data.mime_type}. Decoded bytes len: {len(image_data_bytes)}")
-                                    break # Got the image
-                                except Exception as decode_error:
-                                    logging.error(f"Error decoding base64 image data: {decode_error}")
-                                    # Try using the data directly if decoding fails
-                                    image_data_bytes = part.inline_data.data
-                                    logging.warning(f"Using raw data without base64 decoding.")
-                    elif imagen_response_obj and hasattr(imagen_response_obj, 'candidates') and imagen_response_obj.candidates:
-                        # Try the candidates structure which appears in some Gemini responses
-                        for candidate in imagen_response_obj.candidates:
-                            if hasattr(candidate, 'content') and candidate.content:
-                                for content_part in candidate.content.parts:
-                                    if hasattr(content_part, 'inline_data') and content_part.inline_data and content_part.inline_data.mime_type.startswith("image/"):
-                                        try:
-                                            image_data_bytes = base64.b64decode(content_part.inline_data.data)
-                                            if len(image_data_bytes) < 1000:  # Minimum 1KB for a reasonable image
-                                                logging.warning(f"Image data too small ({len(image_data_bytes)} bytes). May be invalid.")
-                                                if len(image_data_bytes) < 100:  # Extremely small images are definitely invalid
-                                                    logging.error("Image data too small to be valid. Skipping image.")
-                                                    image_data_bytes = None
-                                                    continue
-                                            logging.info(f"Imagen Attempt {imagen_attempt + 1}: Found image in candidates structure. Type: {content_part.inline_data.mime_type}. Size: {len(image_data_bytes)} bytes")
-                                            break
-                                        except Exception as decode_error:
-                                            logging.error(f"Error decoding base64 image data from candidates: {decode_error}")
-                                            continue
-                    elif imagen_response_obj and hasattr(imagen_response_obj, 'blob'): # Another possible way image data might be returned
-                        # This is speculative based on common patterns, adjust if API is different
-                        image_data_bytes = imagen_response_obj.blob 
-                        logging.info(f"Imagen Attempt {imagen_attempt + 1}: Imagen returned image blob directly.")
+                    # Detailed logging of the response structure to help debug
+                    logging.info(f"Imagen response type: {type(imagen_response_obj)}")
+                    if hasattr(imagen_response_obj, 'candidates') and imagen_response_obj.candidates:
+                        logging.info(f"Response has {len(imagen_response_obj.candidates)} candidates")
                     
-                    # Log the full response structure to help diagnose image extraction issues
-                    if not image_data_bytes:
-                        logging.warning(f"Imagen Attempt {imagen_attempt + 1}: Failed to extract image data. Response structure: {str(imagen_response_obj)[:500]}...")
-
+                    # Try to extract image bytes from the response
+                    if imagen_response_obj and hasattr(imagen_response_obj, 'candidates') and imagen_response_obj.candidates:
+                        # Look for image data in the candidates
+                        for candidate_idx, candidate in enumerate(imagen_response_obj.candidates):
+                            logging.info(f"Examining candidate {candidate_idx+1}")
+                            if hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts'):
+                                for part_idx, part in enumerate(candidate.content.parts):
+                                    logging.info(f"Examining part {part_idx+1} of candidate {candidate_idx+1}")
+                                    if hasattr(part, 'inline_data') and part.inline_data:
+                                        logging.info(f"Found inline_data with mime_type: {part.inline_data.mime_type}")
+                                        if part.inline_data.mime_type.startswith("image/"):
+                                            try:
+                                                image_data_bytes = base64.b64decode(part.inline_data.data)
+                                                logging.info(f"Successfully decoded image data. Size: {len(image_data_bytes)} bytes")
+                                                if len(image_data_bytes) < 1000:
+                                                    logging.warning(f"Image data suspiciously small ({len(image_data_bytes)} bytes). May not be a valid image.")
+                                                    if len(image_data_bytes) < 100:
+                                                        logging.error(f"Image too small to be valid, only {len(image_data_bytes)} bytes")
+                                                        continue
+                                                generated_alt_text = image_prompt_for_imagen
+                                                break
+                                            except Exception as e:
+                                                logging.error(f"Error decoding image data: {e}")
+                    
+                    # Log extensive details about response for debugging purposes
+                    if not image_data_bytes and hasattr(imagen_response_obj, 'candidates'):
+                        logging.error("Failed to extract image. Full response structure:")
+                        for candidate_idx, candidate in enumerate(imagen_response_obj.candidates):
+                            logging.error(f"Candidate {candidate_idx+1} content:")
+                            if hasattr(candidate, 'content') and candidate.content:
+                                for part_idx, part in enumerate(candidate.content.parts):
+                                    part_type = "unknown"
+                                    if hasattr(part, 'text'):
+                                        part_type = "text"
+                                        logging.error(f"  Part {part_idx+1}: type={part_type}, content={part.text[:100]}")
+                                    elif hasattr(part, 'inline_data'):
+                                        part_type = "inline_data"
+                                        mime = part.inline_data.mime_type if hasattr(part.inline_data, 'mime_type') else "unknown"
+                                        data_length = len(part.inline_data.data) if hasattr(part.inline_data, 'data') else 0
+                                        logging.error(f"  Part {part_idx+1}: type={part_type}, mime={mime}, data_length={data_length}")
+                                    else:
+                                        logging.error(f"  Part {part_idx+1}: type={part_type}, properties={dir(part)}")
+                    
                     if image_data_bytes:
-                        generated_alt_text = image_prompt_for_imagen # Use the Imagen prompt as alt text by default
-                        logging.info(f"Imagen Attempt {imagen_attempt + 1}: Successfully generated image using Imagen.")
+                        logging.info(f"Imagen Attempt {imagen_attempt + 1}: Successfully generated image. Size: {len(image_data_bytes)} bytes")
                         break # Success, exit Imagen retry loop
                     else:
-                        logging.warning(f"Imagen Attempt {imagen_attempt + 1}: Imagen model did not return usable image data. Response: {imagen_response_obj}")
+                        logging.warning(f"Imagen Attempt {imagen_attempt + 1}: Failed to extract image data from response")
 
-                except ValueError as ve:
-                    logging.error(f"Imagen Attempt {imagen_attempt + 1}: Imagen generation failed (ValueError): {ve}")
-                    # Check for blocking specific to Imagen if its response has prompt_feedback
-                    if hasattr(imagen_response_obj, 'prompt_feedback') and imagen_response_obj.prompt_feedback and imagen_response_obj.prompt_feedback.block_reason:
-                        logging.error(f"Imagen Attempt {imagen_attempt + 1}: Imagen prompt blocked. Reason: {imagen_response_obj.prompt_feedback.block_reason}")
-                        # If blocked, no point retrying with the same prompt for Imagen
-                        break # Exit Imagen retry loop if blocked
                 except Exception as e:
                     logging.error(f"Imagen Attempt {imagen_attempt + 1}: Imagen generation failed: {e}", exc_info=True)
-                
-                if imagen_attempt < MAX_GEMINI_RETRIES - 1 and not image_data_bytes:
-                    logging.info(f"Waiting {GEMINI_RETRY_DELAY_SECONDS}s before next Imagen attempt...")
-                    time.sleep(GEMINI_RETRY_DELAY_SECONDS)
-            # End of Imagen retry loop
 
             if not image_data_bytes:
                 logging.error(f"All {MAX_GEMINI_RETRIES} attempts to generate image with Imagen failed. Proceeding with text-only reply if available.")
