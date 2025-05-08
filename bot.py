@@ -32,7 +32,7 @@ GEMINI_MODEL_NAME = "gemini-2.5-pro-preview-05-06" # Updated model name
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = """You are Gemini Bot (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
-Your developer is symmetricalboy (@symm.social). If users ask for help or about your creator, you can mention them.
+Your developer is symmetricalboy (@symm.social). Only mention your developer if a user *specifically asks* about who created you or how to get help with your development.
 
 Constraints:
 *   Your entire response MUST be a single Bluesky post under 300 characters. This is very important!!
@@ -47,6 +47,8 @@ Constraints:
 MENTION_CHECK_INTERVAL_SECONDS = 15 # Check for new mentions every 15 seconds (was 60)
 MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # How many parent posts to fetch for context
 NOTIFICATION_FETCH_LIMIT = 100 # How many notifications to fetch (was 25)
+MAX_GEMINI_RETRIES = 2  # Initial call + 1 retry
+GEMINI_RETRY_DELAY_SECONDS = 5 # Delay between retries
 
 # Global variables
 bsky_client: Client | None = None
@@ -261,9 +263,11 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             return
 
         dynamic_instruction = (
-            "The following is a Bluesky conversation thread. "
-            "Your primary task is to formulate a direct and relevant reply to the *final message* in this thread. "
-            "Use the preceding messages only for context. "
+            "You are replying within a Bluesky conversation. The conversation history is provided below. "
+            "Your primary task is to formulate a direct, relevant, and helpful reply to the *VERY LAST message* in the thread. "
+            "Analyze the last message carefully. If it's a question, answer it. If it's a request, address it. "
+            "Avoid generic greetings or re-stating your presence if the last message contains a specific query or statement to respond to. "
+            "Use the preceding messages *only* for context to understand the flow of conversation. "
             "If you generate an image, you MUST also provide a concise and descriptive alt text for it, ideally in a separate text part or clearly marked. "
             "Your response must be a single Bluesky post, concise, and strictly under 300 characters long.\\n\\n"
             "---BEGIN THREAD CONTEXT---\\n"
@@ -277,69 +281,85 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         image_data_bytes = None 
         generated_alt_text = "Generated image by Gemini Bot" # Default alt text
 
-        try:
-            logging.info(f"Sending context to Gemini ({GEMINI_MODEL_NAME})... Accessing gemini_model_ref: {type(gemini_model_ref)}")
-            gemini_response_obj = gemini_model_ref.generate_content(
-                full_prompt_for_gemini,
-            )
+        # Retry loop for Gemini call
+        for attempt in range(MAX_GEMINI_RETRIES):
+            try:
+                logging.info(f"Sending context to Gemini ({GEMINI_MODEL_NAME}), attempt {attempt + 1}/{MAX_GEMINI_RETRIES} for {mentioned_post_uri}...")
+                gemini_response_obj = gemini_model_ref.generate_content(
+                    full_prompt_for_gemini,
+                )
 
-            # Process response parts for text, image, and alt text
-            # Temporary holding for text parts to see if one is clearly alt text
-            potential_alt_text_parts = []
-            main_reply_parts = []
+                potential_alt_text_parts = []
+                main_reply_parts = []
+                # Reset for each attempt
+                reply_text = ""
+                image_data_bytes = None 
+                # Keep the default alt text unless overwritten
+                current_attempt_alt_text = "Generated image by Gemini Bot" 
 
-            for part in gemini_response_obj.parts:
-                if hasattr(part, 'text') and part.text:
-                    # Heuristic: if an image is already found, the next text might be alt text.
-                    # Or, we can look for specific keywords if we instruct Gemini.
-                    # For now, let's assume if Gemini is asked for alt text, it might be a distinct part.
-                    # We'll refine this if Gemini's output format is different.
-                    # A simple check: if text contains "alt text:" or similar, or is short and follows an image.
-                    # This is a basic approach. For more complex scenarios, more sophisticated parsing or prompting is needed.
-                    if image_data_bytes and (len(part.text) < 150 and ("alt:" in part.text.lower() or "alt text:" in part.text.lower())):
-                        generated_alt_text = part.text.replace("alt text:", "", 1).replace("alt:", "", 1).strip()
-                        logging.info(f"Found potential alt text from Gemini: {generated_alt_text}")
-                    elif image_data_bytes and not main_reply_parts and len(potential_alt_text_parts) == 0 and len(part.text) < 150:
-                        # If image is present, and this is the first short text part, consider it potential alt text.
-                        potential_alt_text_parts.append(part.text)
+                for part in gemini_response_obj.parts:
+                    if hasattr(part, 'text') and part.text:
+                        if image_data_bytes and (len(part.text) < 150 and ("alt:" in part.text.lower() or "alt text:" in part.text.lower())):
+                            current_attempt_alt_text = part.text.replace("alt text:", "", 1).replace("alt:", "", 1).strip()
+                            logging.info(f"Attempt {attempt + 1}: Found potential alt text from Gemini: {current_attempt_alt_text}")
+                        elif image_data_bytes and not main_reply_parts and len(potential_alt_text_parts) == 0 and len(part.text) < 150:
+                            potential_alt_text_parts.append(part.text)
+                        else:
+                            main_reply_parts.append(part.text)
+                    elif hasattr(part, 'inline_data') and part.inline_data and not image_data_bytes: 
+                        if part.inline_data.mime_type.startswith("image/"):
+                            image_data_bytes = part.inline_data.data
+                            logging.info(f"Attempt {attempt + 1}: Gemini returned an image of type: {part.inline_data.mime_type}")
+                
+                reply_text = " ".join(main_reply_parts).strip()
+                generated_alt_text = current_attempt_alt_text # Set the main alt text from this attempt
+
+                if image_data_bytes and generated_alt_text == "Generated image by Gemini Bot" and potential_alt_text_parts:
+                    generated_alt_text = potential_alt_text_parts[0].strip()
+                    logging.info(f"Attempt {attempt + 1}: Using first short text part as alt text: {generated_alt_text}")
+                    if reply_text == generated_alt_text:
+                        reply_text = ""
+
+                # If we got usable content, break the retry loop
+                if reply_text or image_data_bytes:
+                    logging.info(f"Attempt {attempt + 1}: Successfully got content from Gemini for {mentioned_post_uri}.")
+                    break 
+                else:
+                    logging.warning(f"Attempt {attempt + 1}: Gemini returned no usable text or image for {mentioned_post_uri}.")
+                    # Detailed logging for this attempt if it was empty
+                    if hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback:
+                        logging.warning(f"Attempt {attempt + 1} Gemini prompt feedback for {mentioned_post_uri}: {gemini_response_obj.prompt_feedback}")
+                    if hasattr(gemini_response_obj, 'parts'):
+                        logging.warning(f"Attempt {attempt + 1} Gemini response parts for {mentioned_post_uri}: {gemini_response_obj.parts}")
                     else:
-                        main_reply_parts.append(part.text)
-                elif hasattr(part, 'inline_data') and part.inline_data and not image_data_bytes: # Process only the first image
-                    if part.inline_data.mime_type.startswith("image/"):
-                        image_data_bytes = part.inline_data.data
-                        logging.info(f"Gemini returned an image of type: {part.inline_data.mime_type}")
-            
-            reply_text = " ".join(main_reply_parts).strip()
+                        logging.warning(f"Attempt {attempt + 1} Gemini response object for {mentioned_post_uri} has no 'parts' attribute: {gemini_response_obj}")
 
-            # If we had potential alt text and no specific alt text was found via keyword
-            if image_data_bytes and generated_alt_text == "Generated image by Gemini Bot" and potential_alt_text_parts:
-                generated_alt_text = potential_alt_text_parts[0].strip()
-                logging.info(f"Using first short text part as alt text: {generated_alt_text}")
-                # If this text was also part of the main reply, decide if it should be removed from reply_text
-                # For now, we assume it might be redundant if it was *only* alt text.
-                if reply_text == generated_alt_text:
-                    reply_text = "" # Avoid duplicate content if alt text was the only text
-
-            if not reply_text and not image_data_bytes:
-                logging.warning(f"Gemini returned no usable text or image content for {mentioned_post_uri}. Checking for blockages...")
+            except ValueError as ve: 
+                logging.error(f"Attempt {attempt + 1}: Gemini text/image generation failed for {mentioned_post_uri} (ValueError): {ve}")
                 if hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback.block_reason:
-                    logging.error(f"Gemini prompt blocked. Reason: {gemini_response_obj.prompt_feedback.block_reason}")
-                return
+                    logging.error(f"Attempt {attempt + 1}: Gemini prompt blocked. Reason: {gemini_response_obj.prompt_feedback.block_reason}")
+                # If blocked, no point retrying with the same prompt
+                if "block_reason" in str(ve).lower() or (hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback.block_reason):
+                    return # Exit processing if definitively blocked
+            except Exception as e:
+                logging.error(f"Attempt {attempt + 1}: Gemini content generation failed for {mentioned_post_uri}: {e}", exc_info=True)
             
-            # If only an image is generated, provide some default text.
-            if image_data_bytes and not reply_text:
-                reply_text = "Here's the image you asked for:"
-            elif not reply_text and not image_data_bytes: # Should be caught by earlier check, but good to be safe
-                logging.warning(f"Gemini returned neither text nor image for {mentioned_post_uri}. Skipping.")
-                return
+            # If this was not the last attempt and we didn't break (i.e., no content), wait before retrying
+            if attempt < MAX_GEMINI_RETRIES - 1 and not (reply_text or image_data_bytes):
+                logging.info(f"Waiting {GEMINI_RETRY_DELAY_SECONDS}s before next Gemini attempt for {mentioned_post_uri}...")
+                time.sleep(GEMINI_RETRY_DELAY_SECONDS)
+        # End of retry loop
 
-        except ValueError as ve: 
-            logging.error(f"Gemini text/image generation failed for {mentioned_post_uri} (ValueError): {ve}")
-            if hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback.block_reason:
-                logging.error(f"Gemini prompt blocked. Reason: {gemini_response_obj.prompt_feedback.block_reason}")
+        # Check if all retries failed
+        if not reply_text and not image_data_bytes:
+            logging.error(f"All {MAX_GEMINI_RETRIES} attempts to get content from Gemini failed for {mentioned_post_uri}. Skipping reply.")
             return
-        except Exception as e:
-            logging.error(f"Gemini content generation failed for {mentioned_post_uri}: {e}", exc_info=True)
+            
+        # If only an image is generated, provide some default text.
+        if image_data_bytes and not reply_text:
+            reply_text = "Here's the image you asked for:"
+        elif not reply_text and not image_data_bytes: # Should be caught by earlier check, but good to be safe
+            logging.warning(f"Gemini returned neither text nor image for {mentioned_post_uri}. Skipping.")
             return
 
         # Prepare post content (text, facets, embed)
@@ -348,30 +368,36 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         facets = []
         if post_text: 
             # Mentions (ensure DID resolution for production)
-            for match in re.finditer(r'@([a-zA-Z0-9_.-]+(?:\.[a-zA-Z]+)?)', post_text): # Improved handle matching
+            mention_pattern = r'@([a-zA-Z0-9_.-]+(?:\.[a-zA-Z]+)?)' # Improved handle matching
+            for match in re.finditer(mention_pattern, post_text):
                 handle = match.group(1)
+                # Calculate byte offsets correctly
+                byte_start = len(post_text[:match.start()].encode('utf-8'))
+                byte_end = len(post_text[:match.end()].encode('utf-8'))
+                
                 # Placeholder DID - resolve to actual DID in a real application
                 # resolved_did = resolve_handle_to_did(handle) # You'd need this function
                 # if resolved_did:
                 facets.append(
                     at_models.AppBskyRichtextFacet.Main(
-                        index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=match.start(), byteEnd=match.end()),
+                        index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=byte_start, byteEnd=byte_end),
                         features=[at_models.AppBskyRichtextFacet.Mention(did=f"did:plc:{handle}")] # Replace with resolved_did
                     )
                 )
             
             # Links (more robust regex)
-            # Regex to find URLs, including those with paths, queries, and fragments, and ensures they are not part of a markdown link already
-            # It tries to avoid matching things like "file.txt" or partial domains unless they start with http/https.
-            # A more standard URL regex:
             url_pattern = r'https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)'
             for match in re.finditer(url_pattern, post_text):
                 uri = match.group(0) # group(0) gets the entire match
                 # Validate if URI is well-formed before adding facet (optional, basic check here)
                 if "://" in uri: # Simple check to ensure it looks like a protocol URI
+                    # Calculate byte offsets correctly
+                    byte_start = len(post_text[:match.start()].encode('utf-8'))
+                    byte_end = len(post_text[:match.end()].encode('utf-8'))
+
                     facets.append(
                         at_models.AppBskyRichtextFacet.Main(
-                            index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=match.start(), byteEnd=match.end()),
+                            index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=byte_start, byteEnd=byte_end),
                             features=[at_models.AppBskyRichtextFacet.Link(uri=uri)]
                         )
                     )
