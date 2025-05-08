@@ -157,46 +157,43 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             return
             
         # --- Start: Checks for skipping --- 
-
-        # Check 1: If it's a 'reply' notification, ensure it's a direct reply TO THE BOT.
         if notification.reason == 'reply':
-            parent_view = thread_view_of_mentioned_post.parent # The parent of the post that triggered the notification
-            # The post that triggered the notification IS target_post. Its parent should be by the bot.
-            if isinstance(parent_view, at_models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
-                parent_of_triggering_post = parent_view.post # This is the post the user actually replied to.
-                if parent_of_triggering_post.author.handle != BLUESKY_HANDLE:
-                    logging.info(f"Skipping reply notification {notification.uri}: The replied-to post ({parent_of_triggering_post.uri}) was not authored by bot ({BLUESKY_HANDLE}).")
-                    return 
-            else: 
-                # If we can't identify the parent post of the triggering reply, it's ambiguous.
-                # This could happen if the reply is to a very old/deleted post or structure is odd.
-                logging.warning(f"Could not identify parent of triggering reply {notification.uri}. Skipping for safety.")
+            parent_view = thread_view_of_mentioned_post.parent 
+            if not (isinstance(parent_view, at_models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post):
+                logging.warning(f"[DUPE CHECK REPLY] Skipping reply: Could not identify parent of triggering reply {notification.uri}.")
                 return
 
-        # Check 2: Has the bot ALREADY replied directly to the TARGET_POST?
-        # For 'mention', target_post is the post containing the mention.
-        # For 'reply', target_post is the new reply itself. We need to check replies to *its parent* (which we confirmed above is the bot's post).
-        
-        post_to_check_for_bot_replies = None
-        if notification.reason == 'mention':
-            post_to_check_for_bot_replies = thread_view_of_mentioned_post # Check replies to the post containing the mention
-        elif notification.reason == 'reply':
-            # We already verified the parent of target_post is by the bot.
-            # So, we need to see the thread of that parent to check its replies.
-            if isinstance(thread_view_of_mentioned_post.parent, at_models.AppBskyFeedDefs.ThreadViewPost):
-                 post_to_check_for_bot_replies = thread_view_of_mentioned_post.parent
-            # else: this case should have been caught by the parent check above for replies.
+            bots_post_that_was_replied_to = parent_view.post
+            if bots_post_that_was_replied_to.author.handle != BLUESKY_HANDLE:
+                logging.info(f"[DUPE CHECK REPLY] Skipping reply: Replied-to post {bots_post_that_was_replied_to.uri} not by bot.")
+                return
 
-        if post_to_check_for_bot_replies and post_to_check_for_bot_replies.replies:
-            for reply_in_thread in post_to_check_for_bot_replies.replies:
-                if reply_in_thread.post and reply_in_thread.post.author and reply_in_thread.post.author.handle == BLUESKY_HANDLE:
-                    # If the reply is to the bot's own post (notification.reason == 'reply'),
-                    # we need to ensure this bot reply isn't the trigger_post itself if multiple replies came in fast.
-                    if notification.reason == 'reply' and reply_in_thread.post.uri == target_post.uri:
-                        continue # This is the triggering reply itself, not a pre-existing duplicate by the bot.
-                    
-                    logging.info(f"Detected existing reply by bot under {post_to_check_for_bot_replies.post.uri if post_to_check_for_bot_replies.post else 'target context'}. Skipping notification {notification.uri}.")
-                    return
+            # Now, check if the bot has ALREADY sent another reply to its OWN post (bots_post_that_was_replied_to)
+            # We look at the replies of `parent_view` (which is the ThreadViewPost of bots_post_that_was_replied_to)
+            if parent_view.replies:
+                for reply_to_bots_post in parent_view.replies:
+                    if reply_to_bots_post.post and reply_to_bots_post.post.author and reply_to_bots_post.post.author.handle == BLUESKY_HANDLE:
+                        # This is a reply by the bot, to its own post.
+                        # `target_post` is the user's current reply that triggered this notification.
+                        # If this existing bot reply is NOT the same as the user's current reply, it means the bot already sent a reply previously.
+                        if reply_to_bots_post.post.uri != target_post.uri: 
+                             logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_bots_post.post.uri} to bot's own post {bots_post_that_was_replied_to.uri}. Current trigger is {target_post.uri}. Skipping.")
+                             return
+                        # else:
+                        #    logging.debug(f"[DUPE CHECK REPLY] Bot reply {reply_to_bots_post.post.uri} is the current trigger {target_post.uri}. This is expected if no other bot reply to parent exists.")
+            # else:
+            #    logging.debug(f"[DUPE CHECK REPLY] No replies found under bot's own post {bots_post_that_was_replied_to.uri} to check for duplicates against.")
+
+        elif notification.reason == 'mention':
+            # Check replies to the post containing the mention (which is target_post for mentions)
+            # thread_view_of_mentioned_post is the view of the post with the mention.
+            if thread_view_of_mentioned_post.replies:
+                for reply_in_thread in thread_view_of_mentioned_post.replies:
+                    if reply_in_thread.post and reply_in_thread.post.author and reply_in_thread.post.author.handle == BLUESKY_HANDLE:
+                        logging.info(f"[DUPE CHECK MENTION] Found pre-existing bot reply {reply_in_thread.post.uri} to mentioned post {target_post.uri}. Skipping.")
+                        return
+            # else:
+            #    logging.debug(f"[DUPE CHECK MENTION] No replies found under mentioned post {target_post.uri} to check for bot duplicates.")
         
         # --- End: Checks for skipping --- 
 
