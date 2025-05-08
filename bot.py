@@ -10,7 +10,7 @@ import google.generativeai as genai
 from atproto_client.models.app.bsky.notification.list_notifications import Params as ListNotificationsParams
 
 # Configure basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load environment variables
 load_dotenv()
