@@ -13,6 +13,8 @@ import re # Import regular expressions
 from atproto_client.models.app.bsky.notification.list_notifications import Params as ListNotificationsParams
 # Import the specific Params model for get_post_thread
 from atproto_client.models.app.bsky.feed.get_post_thread import Params as GetPostThreadParams
+# Import the specific Params model for get_posts
+from atproto_client.models.app.bsky.feed.get_posts import Params as GetPostsParams
 # Import Facet and Embed models
 from atproto import models as at_models 
 
@@ -153,7 +155,8 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 logging.info(f"[Reply Check] Notification for {target_post.uri}. It replies to parent URI: {parent_ref.uri}. Fetching parent...")
                 
                 try:
-                    parent_post_response = bsky_client.app.bsky.feed.get_posts(uris=[parent_ref.uri])
+                    get_posts_params = GetPostsParams(uris=[parent_ref.uri])
+                    parent_post_response = bsky_client.app.bsky.feed.get_posts(params=get_posts_params)
                     if parent_post_response and parent_post_response.posts and len(parent_post_response.posts) == 1:
                         immediate_parent_post = parent_post_response.posts[0]
                         logging.info(f"[Reply Check] Fetched immediate parent post. Author: {immediate_parent_post.author.handle}")
