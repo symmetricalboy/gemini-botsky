@@ -38,6 +38,7 @@ NOTIFICATION_FETCH_LIMIT = 100 # How many notifications to fetch (was 25)
 # Global variables
 bsky_client: Client | None = None
 gemini_model: genai.GenerativeModel | None = None
+processed_uris_this_run: set[str] = set() # Track URIs processed in this run to handle is_read lag
 
 def initialize_bluesky_client() -> Client | None:
     """Initializes and logs in the Bluesky client."""
@@ -118,12 +119,15 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
 
 def process_mention(notification: at_models.AppBskyNotificationListNotifications.Notification, gemini_model_ref: genai.GenerativeModel):
     """Processes a single mention/reply notification."""
-    global bsky_client # Ensure bsky_client is accessible
+    global bsky_client, processed_uris_this_run # Ensure globals are accessible
     if not bsky_client:
         logging.error("Bluesky client not initialized in process_mention. Cannot process mention.")
         return
 
     mentioned_post_uri = notification.uri
+    # Mark as seen for this run *before* any processing attempts to prevent loops if is_read lags
+    processed_uris_this_run.add(mentioned_post_uri)
+    
     logging.info(f"Processing mention/reply in post: {mentioned_post_uri}")
 
     try:
@@ -140,30 +144,26 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             logging.warning(f"Thread view for {mentioned_post_uri} does not contain a post.")
             return
             
-        # --- Start: DUPLICATE and SELF-REPLY CHECKS ---
-        # Check if the notification is for a post made by the bot itself
-        if target_post.author.handle == BLUESKY_HANDLE:
-            logging.info(f"[SKIP] Notification {notification.uri} is for a post made by the bot itself. Skipping.")
-            return
-
-        # Check if this is a reply to one of the bot's own posts
+        # --- Updated Reply Handling & Duplicate Check ---
         if notification.reason == 'reply':
             parent_view = thread_view_of_mentioned_post.parent 
             if isinstance(parent_view, at_models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
-                bots_post_that_was_replied_to = parent_view.post
-                if bots_post_that_was_replied_to.author.handle == BLUESKY_HANDLE:
-                    # This is a reply to one of the bot's posts.
-                    # Check if the bot has already replied to *its own post* (bots_post_that_was_replied_to)
-                    # in response to *this specific user's reply* (target_post).
-                    # More simply: Has the bot already replied to *this* triggering reply (target_post)?
-                    if thread_view_of_mentioned_post.replies: # Check replies under the user's reply (target_post)
-                        for reply_to_users_reply in thread_view_of_mentioned_post.replies:
-                            if reply_to_users_reply.post and reply_to_users_reply.post.author and \
-                               reply_to_users_reply.post.author.handle == BLUESKY_HANDLE:
-                                logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_users_reply.post.uri} to user's reply {target_post.uri}. Skipping.")
-                                return
-            # else: # This case means the reply is not to the bot, or parent is not fetchable.
-            #    logging.debug(f"Reply {notification.uri} is not to one of the bot's posts or parent not identifiable.")
+                parent_post = parent_view.post
+                # **NEW LOGIC**: If the parent post (the one being replied to) is by the bot, IGNORE the reply entirely.
+                if parent_post.author.handle == BLUESKY_HANDLE:
+                    logging.info(f"[IGNORE REPLY] Notification {notification.uri} is a reply to a post made by the bot ({parent_post.uri}). Ignoring.")
+                    return
+                
+                # Original check (now secondary): Has the bot already replied to *this specific* user reply (target_post)?
+                # This might still be useful if the ignore logic above fails, but primarily we want to avoid replying to replies-to-bot.
+                if thread_view_of_mentioned_post.replies: # Check replies under the user's reply (target_post)
+                    for reply_to_users_reply in thread_view_of_mentioned_post.replies:
+                        if reply_to_users_reply.post and reply_to_users_reply.post.author and \
+                           reply_to_users_reply.post.author.handle == BLUESKY_HANDLE:
+                            logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_users_reply.post.uri} to user's reply {target_post.uri}. Skipping.")
+                            return
+            # else: # Parent view/post not available or not the right type
+            #    logging.debug(f"Could not determine parent post author for reply {notification.uri}.")
 
         elif notification.reason == 'mention':
             # Check replies to the post containing the mention (target_post)
@@ -325,7 +325,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
 
 def main_bot_loop():
     """Main loop for the bot to check for mentions and process them."""
-    global bsky_client, gemini_model # Ensure access to initialized clients
+    global bsky_client, gemini_model, processed_uris_this_run # Ensure access to initialized clients
 
     if not (bsky_client and gemini_model):
         logging.critical("Bluesky client or Gemini model not initialized. Exiting main loop.")
@@ -354,6 +354,11 @@ def main_bot_loop():
                     
                     if notification.is_read:
                         logging.debug(f"Skipping already read notification: {notification.uri}")
+                        continue
+
+                    # Skip if already processed in this run (handles is_read lag)
+                    if notification.uri in processed_uris_this_run:
+                        logging.debug(f"Skipping notification {notification.uri} already processed in this run.")
                         continue
 
                     # Skip if notification is from the bot itself to avoid loops or self-processing
