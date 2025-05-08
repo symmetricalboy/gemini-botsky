@@ -35,11 +35,9 @@ MENTION_CHECK_INTERVAL_SECONDS = 15 # Check for new mentions every 15 seconds (w
 MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # How many parent posts to fetch for context
 NOTIFICATION_FETCH_LIMIT = 100 # How many notifications to fetch (was 25)
 
-# Global variable to store the client, to be initialized in main()
-bsky_client = None 
-# Global variable to store the timestamp of the last processed mention
-# Using a file for persistence across restarts would be more robust
-last_processed_mention_ctime = None 
+# Global variables
+bsky_client: Client | None = None
+gemini_model: genai.GenerativeModel | None = None
 
 def initialize_bluesky_client() -> Client | None:
     """Initializes and logs in the Bluesky client."""
@@ -67,14 +65,6 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
     
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-
-        # --- REMOVING TEMPORARY MODEL LISTING --- 
-        # logging.info("--- Listing Available Gemini Models (for v1beta API) ---")
-        # for m in genai.list_models():
-        #    ...
-        # logging.info("--- Finished Listing Available Models ---")
-        # --- END REMOVAL --- 
-
         model = genai.GenerativeModel(
             model_name=GEMINI_MODEL_NAME, 
             system_instruction=BOT_SYSTEM_INSTRUCTION,
@@ -85,10 +75,10 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
                 {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
             ]
         )
-        logging.info(f"Successfully initialized Gemini model with: {GEMINI_MODEL_NAME}") # Updated log message
+        logging.info(f"Successfully initialized Gemini model with: {GEMINI_MODEL_NAME}")
         return model
     except Exception as e:
-        logging.error(f"Failed to initialize Gemini model: {e}", exc_info=True) # Simplified error message
+        logging.error(f"Failed to initialize Gemini model: {e}", exc_info=True)
         return None
 
 def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost, own_handle: str) -> str | None:
@@ -99,50 +89,44 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
     history = []
     current_view = thread_view
 
-    # Traverse up the parent chain from the mentioned post
     while current_view:
         if isinstance(current_view, models.AppBskyFeedDefs.ThreadViewPost) and current_view.post:
             post_record = current_view.post.record
-            # We are interested in app.bsky.feed.post records with text
             if isinstance(post_record, models.AppBskyFeedPost.Record) and hasattr(post_record, 'text'):
                 author_display_name = current_view.post.author.display_name or current_view.post.author.handle
                 text = post_record.text
-                # Optional: filter out bot's own previous messages if own_handle == current_view.post.author.handle
                 history.append(f"{author_display_name} (@{current_view.post.author.handle}): {text}")
         elif isinstance(current_view, (models.AppBskyFeedDefs.NotFoundPost, models.AppBskyFeedDefs.BlockedPost)):
             logging.warning(f"Encountered NotFoundPost or BlockedPost while traversing thread parent: {current_view}")
-            break # Stop if we hit a part of the thread that's not accessible
+            break 
         
-        # Move to the parent
         if hasattr(current_view, 'parent') and current_view.parent:
             current_view = current_view.parent
         else:
-            break # No more parents
+            break
 
-    history.reverse() # Order from root to the mentioned post
+    history.reverse() 
     
     if not history:
         logging.warning("Could not construct any context from the thread.")
-        # Attempt to use the main post text directly if it's a text post
         if isinstance(thread_view.post.record, models.AppBskyFeedPost.Record) and hasattr(thread_view.post.record, 'text'):
             author_display_name = thread_view.post.author.display_name or thread_view.post.author.handle
             return f"{author_display_name} (@{thread_view.post.author.handle}): {thread_view.post.record.text}"
-        return None # "Unable to retrieve thread context." -> handled by None return
+        return None
         
-    return "\n\n".join(history)
+    return "\\\\n\\\\n".join(history)
 
-def process_mention(notification: at_models.AppBskyNotificationListNotifications.Notification, gemini_model: genai.GenerativeModel):
+def process_mention(notification: at_models.AppBskyNotificationListNotifications.Notification, gemini_model_ref: genai.GenerativeModel):
     """Processes a single mention/reply notification."""
-    global bsky_client
+    global bsky_client # Ensure bsky_client is accessible
     if not bsky_client:
-        logging.error("Bluesky client not initialized. Cannot process mention.")
+        logging.error("Bluesky client not initialized in process_mention. Cannot process mention.")
         return
 
     mentioned_post_uri = notification.uri
     logging.info(f"Processing mention/reply in post: {mentioned_post_uri}")
 
     try:
-        # Fetch the thread containing the mention/reply
         params = GetPostThreadParams(uri=mentioned_post_uri, depth=MAX_THREAD_DEPTH_FOR_CONTEXT)
         thread_view_response = bsky_client.app.bsky.feed.get_post_thread(params=params)
         
@@ -156,90 +140,75 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             logging.warning(f"Thread view for {mentioned_post_uri} does not contain a post.")
             return
             
-        # --- Start: Checks for skipping --- 
+        # --- Start: DUPLICATE and SELF-REPLY CHECKS ---
+        # Check if the notification is for a post made by the bot itself
+        if target_post.author.handle == BLUESKY_HANDLE:
+            logging.info(f"[SKIP] Notification {notification.uri} is for a post made by the bot itself. Skipping.")
+            return
+
+        # Check if this is a reply to one of the bot's own posts
         if notification.reason == 'reply':
             parent_view = thread_view_of_mentioned_post.parent 
-            if not (isinstance(parent_view, at_models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post):
-                logging.warning(f"[DUPE CHECK REPLY] Skipping reply: Could not identify parent of triggering reply {notification.uri}.")
-                return
-
-            bots_post_that_was_replied_to = parent_view.post
-            if bots_post_that_was_replied_to.author.handle != BLUESKY_HANDLE:
-                logging.info(f"[DUPE CHECK REPLY] Skipping reply: Replied-to post {bots_post_that_was_replied_to.uri} not by bot.")
-                return
-
-            # Now, check if the bot has ALREADY sent another reply to its OWN post (bots_post_that_was_replied_to)
-            # We look at the replies of `parent_view` (which is the ThreadViewPost of bots_post_that_was_replied_to)
-            if parent_view.replies:
-                for reply_to_bots_post in parent_view.replies:
-                    if reply_to_bots_post.post and reply_to_bots_post.post.author and reply_to_bots_post.post.author.handle == BLUESKY_HANDLE:
-                        # This is a reply by the bot, to its own post.
-                        # `target_post` is the user's current reply that triggered this notification.
-                        # If this existing bot reply is NOT the same as the user's current reply, it means the bot already sent a reply previously.
-                        if reply_to_bots_post.post.uri != target_post.uri: 
-                             logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_bots_post.post.uri} to bot's own post {bots_post_that_was_replied_to.uri}. Current trigger is {target_post.uri}. Skipping.")
-                             return
-                        # else:
-                        #    logging.debug(f"[DUPE CHECK REPLY] Bot reply {reply_to_bots_post.post.uri} is the current trigger {target_post.uri}. This is expected if no other bot reply to parent exists.")
-            # else:
-            #    logging.debug(f"[DUPE CHECK REPLY] No replies found under bot's own post {bots_post_that_was_replied_to.uri} to check for duplicates against.")
+            if isinstance(parent_view, at_models.AppBskyFeedDefs.ThreadViewPost) and parent_view.post:
+                bots_post_that_was_replied_to = parent_view.post
+                if bots_post_that_was_replied_to.author.handle == BLUESKY_HANDLE:
+                    # This is a reply to one of the bot's posts.
+                    # Check if the bot has already replied to *its own post* (bots_post_that_was_replied_to)
+                    # in response to *this specific user's reply* (target_post).
+                    # More simply: Has the bot already replied to *this* triggering reply (target_post)?
+                    if thread_view_of_mentioned_post.replies: # Check replies under the user's reply (target_post)
+                        for reply_to_users_reply in thread_view_of_mentioned_post.replies:
+                            if reply_to_users_reply.post and reply_to_users_reply.post.author and \
+                               reply_to_users_reply.post.author.handle == BLUESKY_HANDLE:
+                                logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_users_reply.post.uri} to user's reply {target_post.uri}. Skipping.")
+                                return
+            # else: # This case means the reply is not to the bot, or parent is not fetchable.
+            #    logging.debug(f"Reply {notification.uri} is not to one of the bot's posts or parent not identifiable.")
 
         elif notification.reason == 'mention':
-            # Check replies to the post containing the mention (which is target_post for mentions)
-            # thread_view_of_mentioned_post is the view of the post with the mention.
+            # Check replies to the post containing the mention (target_post)
             if thread_view_of_mentioned_post.replies:
                 for reply_in_thread in thread_view_of_mentioned_post.replies:
                     if reply_in_thread.post and reply_in_thread.post.author and reply_in_thread.post.author.handle == BLUESKY_HANDLE:
                         logging.info(f"[DUPE CHECK MENTION] Found pre-existing bot reply {reply_in_thread.post.uri} to mentioned post {target_post.uri}. Skipping.")
                         return
-            # else:
-            #    logging.debug(f"[DUPE CHECK MENTION] No replies found under mentioned post {target_post.uri} to check for bot duplicates.")
-        
-        # --- End: Checks for skipping --- 
+        # --- End: DUPLICATE and SELF-REPLY CHECKS ---
 
-        # Construct context for Gemini
         context_string = format_thread_for_gemini(thread_view_of_mentioned_post, BLUESKY_HANDLE)
         if not context_string:
             logging.warning(f"Failed to generate context string for {mentioned_post_uri}. Skipping reply.")
             return
 
-        # NEW: Construct the full prompt for Gemini
-        # The BOT_SYSTEM_INSTRUCTION is set at model initialization.
-        # This dynamic instruction guides the model for *this specific request*.
         dynamic_instruction = (
             "The following is a Bluesky conversation thread. "
             "Your primary task is to formulate a direct and relevant reply to the *final message* in this thread. "
             "Use the preceding messages only for context. "
-            "Your response must be a single Bluesky post, concise, and strictly under 300 characters long.\n\n"
-            "---BEGIN THREAD CONTEXT---\n"
+            "Your response must be a single Bluesky post, concise, and strictly under 300 characters long.\\\\n\\\\n"
+            "---BEGIN THREAD CONTEXT---\\\\n"
         )
-        # Ensure there's a clear separation if context_string might also have delimiters.
-        # For now, simple concatenation is fine.
-        full_prompt_for_gemini = dynamic_instruction + context_string + "\n---END THREAD CONTEXT---"
+        full_prompt_for_gemini = dynamic_instruction + context_string + "\\\\n---END THREAD CONTEXT---"
         
-        logging.debug(f"Generated full prompt for Gemini:\n{full_prompt_for_gemini}")
+        logging.debug(f"Generated full prompt for Gemini:\\\\n{full_prompt_for_gemini}")
         
-        gemini_response = None
+        gemini_response_obj = None # Renamed to avoid confusion with bsky_client.send_post response
         reply_text = None
         image_data_bytes = None
-        generated_alt_text = "Generated image"
+        # generated_alt_text = "Generated image" # Not used yet
 
         try:
             logging.info(f"Sending context to Gemini ({GEMINI_MODEL_NAME})...")
-            gemini_response = gemini_model.generate_content(full_prompt_for_gemini)
+            gemini_response_obj = gemini_model_ref.generate_content(full_prompt_for_gemini)
 
-            # Extract text part first - This try/except was problematic
             try:
-                 reply_text = gemini_response.text
+                 reply_text = gemini_response_obj.text
             except ValueError as ve: 
                  logging.error(f"Gemini text generation failed for {mentioned_post_uri} (ValueError): {ve}")
-                 if hasattr(gemini_response, 'prompt_feedback') and gemini_response.prompt_feedback.block_reason:
-                     logging.error(f"Gemini prompt blocked. Reason: {gemini_response.prompt_feedback.block_reason}")
-                 reply_text = "" # Allow empty text if image might exist
-            # No separate except needed here if the main one below covers general errors
+                 if hasattr(gemini_response_obj, 'prompt_feedback') and gemini_response_obj.prompt_feedback.block_reason:
+                     logging.error(f"Gemini prompt blocked. Reason: {gemini_response_obj.prompt_feedback.block_reason}")
+                 reply_text = "" 
             
-            if hasattr(gemini_response, 'parts'):
-                for part in gemini_response.parts:
+            if hasattr(gemini_response_obj, 'parts'):
+                for part in gemini_response_obj.parts:
                     if hasattr(part, 'inline_data') and part.inline_data and hasattr(part.inline_data, 'mime_type') and part.inline_data.mime_type.startswith('image/'):
                         if hasattr(part.inline_data, 'data') and isinstance(part.inline_data.data, bytes):
                              image_data_bytes = part.inline_data.data
@@ -247,358 +216,214 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                              break 
                         else:
                              logging.warning("Found image part in Gemini response, but 'data' attribute missing or not bytes.")
-        except Exception as e: # This is the main except for the Gemini call
-            logging.error(f"Gemini API call or initial response processing failed for {mentioned_post_uri}: {e}", exc_info=True)
-            return 
+        except Exception as e:
+            logging.error(f"Gemini content generation failed for {mentioned_post_uri}: {e}", exc_info=True)
+            # Potentially send a generic error reply, or just skip. For now, skip.
+            return
 
         if not reply_text and not image_data_bytes:
-             logging.info(f"Gemini returned no usable text or image for {mentioned_post_uri}. Skipping reply.")
-             return
+            logging.warning(f"Gemini returned no usable content (text or image) for {mentioned_post_uri}. Skipping reply.")
+            return
 
-        logging.info(f'Gemini reply text for {mentioned_post_uri}: "{reply_text[:50]}..."')
-        if image_data_bytes:
-             logging.info(f'Gemini also provided image data.') # Don't log bytes here
-
-        # --- Embed Generation (if image exists) ---
-        embed_to_send = None
-        if image_data_bytes:
-             try:
-                 logging.info("Uploading image blob to Bluesky...")
-                 upload_response = bsky_client.upload_blob(image_data_bytes)
-                 
-                 if upload_response and upload_response.blob:
-                      logging.info(f"Image blob uploaded successfully: CID={upload_response.blob.ref.cid}") # Access cid via ref
-                      
-                      image_to_embed = at_models.AppBskyEmbedImages.Image(
-                           alt=generated_alt_text, 
-                           image=upload_response.blob # Pass the blob object directly
-                      )
-                      embed_to_send = at_models.AppBskyEmbedImages.Main(images=[image_to_embed])
-                      logging.info("Created image embed structure.")
-                 else:
-                      logging.error("Failed to upload image blob or blob reference missing in response.")
-
-             except AtProtocolError as e:
-                 logging.error(f"Bluesky API error during image blob upload: {e}")
-             except Exception as e:
-                 logging.error(f"Unexpected error during image blob upload or embed creation: {e}", exc_info=True)
-                 # Continue without embed if upload failed
-
-        # --- Facet Generation Start ---
+        # Prepare post content (text, embed, facets)
+        post_text = reply_text if reply_text else "" # Ensure post_text is a string
+        
+        # Facet creation for mentions and links (simplified)
         facets = []
-        try:
-            # --- Step 1: Mentions ---
-            # Regex to find handles (including the leading @)
-            handle_regex = r'@((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.){1,}[a-zA-Z]{2,})'
-            reply_text_bytes = reply_text.encode('utf-8')
-            used_byte_ranges = [] # Keep track of used ranges to prevent overlaps
-
-            for match in re.finditer(handle_regex, reply_text):
-                handle_with_at = match.group(0)
-                handle_only = match.group(1)
+        if post_text: # Only create facets if there is text
+            # Example: Detect @mentions (simple regex, can be improved)
+            for match in re.finditer(r'@([a-zA-Z0-9_.-]+)', post_text):
+                handle = match.group(1)
+                # Ideally, resolve handle to DID here for robust facets
+                # For simplicity, we'll assume it's a valid handle string for now.
+                # Note: This is a naive implementation. For production, use DID resolution.
+                facets.append(
+                    at_models.AppBskyRichtextFacet.Main(
+                        index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=match.start(), byteEnd=match.end()),
+                        features=[at_models.AppBskyRichtextFacet.Mention(did=f"did:plc:{handle}")] # Placeholder DID!
+                    )
+                )
+            # Example: Detect links (simple regex, can be improved)
+            for match in re.finditer(r'(https?://[^\\s]+)', post_text):
+                uri = match.group(1)
+                facets.append(
+                    at_models.AppBskyRichtextFacet.Main(
+                        index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=match.start(), byteEnd=match.end()),
+                        features=[at_models.AppBskyRichtextFacet.Link(uri=uri)]
+                    )
+                )
+        
+        # Embed image if present
+        embed_to_post = None
+        if image_data_bytes:
+            try:
+                logging.info(f"Uploading image for post related to {mentioned_post_uri}...")
+                # Upload image bytes to Bluesky and get blob reference
+                upload_response = bsky_client.com.atproto.repo.upload_blob(data=image_data_bytes) # type: ignore
                 
-                # Calculate byte indices based on byte string
-                mention_bytes = handle_with_at.encode('utf-8')
-                byte_start = reply_text_bytes.find(mention_bytes, match.start())
-                if byte_start != -1:
-                    byte_end = byte_start + len(mention_bytes)
-                else:
-                    logging.warning(f"Could not find byte offset for mention '{handle_with_at}' in reply text. Skipping facet.")
-                    continue
-                
-                # Check for overlap - skip if this range is already covered
-                if any(max(byte_start, r[0]) < min(byte_end, r[1]) for r in used_byte_ranges):
-                    logging.debug(f"Skipping mention facet for {handle_with_at} due to overlap.")
-                    continue
-
-                logging.info(f"Found potential mention: {handle_with_at} (bytes {byte_start}-{byte_end})")
-
-                try:
-                    resolve_response = bsky_client.resolve_handle(handle=handle_only)
-                    resolved_did = resolve_response.did
-                    logging.info(f"Resolved {handle_only} to DID: {resolved_did}")
+                if upload_response and hasattr(upload_response, 'blob') and upload_response.blob: # type: ignore
+                    image_blob = upload_response.blob # type: ignore
+                    logging.info(f"Image uploaded successfully, blob CID: {image_blob.cid}") # type: ignore
                     
-                    mention_feature = at_models.AppBskyRichtextFacet.Mention(did=resolved_did)
-                    facet = at_models.AppBskyRichtextFacet.Main(
-                        index=at_models.AppBskyRichtextFacet.ByteSlice(byte_start=byte_start, byte_end=byte_end),
-                        features=[mention_feature]
-                    )
-                    facets.append(facet)
-                    used_byte_ranges.append((byte_start, byte_end)) # Mark range as used
-                except AtProtocolError as e:
-                    logging.warning(f"Failed to resolve handle '{handle_only}': {e}. Mention will be plain text.")
-                except Exception as e:
-                    logging.error(f"Unexpected error resolving handle '{handle_only}': {e}", exc_info=True)
+                    # Create image embed object
+                    # For alt text, ideally Gemini would provide this, or a default is used.
+                    alt_text_for_image = "Image generated by Gemini" # Placeholder alt text
+                    if reply_text and len(reply_text) < 100 : # Use reply as alt text if short
+                         alt_text_for_image = reply_text 
+                    elif not reply_text: # If no text, use a generic alt text for image-only posts
+                         alt_text_for_image = "AI-generated image"
 
-            # --- Step 2: Links ---
-            # Simple regex for http/https URLs
-            # Updated regex: \S+ instead of [\S]+
-            link_regex = r'https?://\S+' 
-            for match in re.finditer(link_regex, reply_text):
-                url = match.group(0)
-                
-                # Calculate byte indices
-                link_bytes = url.encode('utf-8')
-                byte_start = reply_text_bytes.find(link_bytes, match.start())
-                if byte_start != -1:
-                    byte_end = byte_start + len(link_bytes)
+                    embed_to_post = at_models.AppBskyEmbedImages.Main(
+                        images=[at_models.AppBskyEmbedImages.Image(image=image_blob, alt=alt_text_for_image)]
+                    )
                 else:
-                    logging.warning(f"Could not find byte offset for link '{url}'. Skipping facet.")
-                    continue
+                    logging.error("Failed to upload image or blob reference not found in response.")
+            except Exception as e:
+                logging.error(f"Error during image upload or embed creation: {e}", exc_info=True)
+                # Proceed without image if upload fails
+        
+        # Root and parent for the reply
+        reply_root = thread_view_of_mentioned_post.root if thread_view_of_mentioned_post.root else target_post.uri
+        reply_parent = target_post.uri # Reply directly to the post that mentioned the bot
 
-                # Check for overlap - skip if this range is already covered
-                if any(max(byte_start, r[0]) < min(byte_end, r[1]) for r in used_byte_ranges):
-                    logging.debug(f"Skipping link facet for {url} due to overlap.")
-                    continue
-                
-                logging.info(f"Found potential link: {url} (bytes {byte_start}-{byte_end})")
-                try:
-                    # Basic validation (already done by regex mostly, but good practice)
-                    if not url.startswith(('http://', 'https://')): 
-                         logging.warning(f"Skipping link facet for {url}: Does not start with http(s)://")
-                         continue
+        # Ensure reply_root and reply_parent are FeedViewPost or PostView objects from which .uri and .cid can be extracted
+        # The API expects models.ComAtprotoRepoStrongRef.Main objects for root and parent
+        if isinstance(reply_root, (at_models.AppBskyFeedDefs.PostView, at_models.AppBskyFeedDefs.ThreadViewPost)): # type: ignore
+            root_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=reply_root.cid, uri=reply_root.uri) # type: ignore
+        elif isinstance(reply_root, str): # If it's already a URI string (e.g. target_post.uri)
+            # We need to fetch the post to get its CID for StrongRef, or API might allow just URI for non-validated refs
+            # For simplicity, if it's the target_post, we have its CID
+            if reply_root == target_post.uri:
+                 root_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
+            else: # Fallback if root is a URI string and not target_post (less ideal)
+                 logging.warning(f"Root post {reply_root} is a URI string, attempting to use directly. May need CID.")
+                 # This might fail if API strictly needs CID. Fetching post to get CID is more robust.
+                 # For now, let's assume it might work or the SDK handles it.
+                 # A better approach would be to ensure we always have the PostView for the root.
+                 # However, target_post.uri for reply_root when target_post is the actual root is fine.
+                 # Let's refine this: if thread_view_of_mentioned_post.root is a string, it's a URI.
+                 # We need its CID.
+                 # The `target_post` is `thread_view_of_mentioned_post.post`.
+                 # If `thread_view_of_mentioned_post.root` is a string (URI), we'd need to fetch that post
+                 # to get its CID. For now, we simplify: if `thread_view_of_mentioned_post.root` is a string,
+                 # we'll use `target_post` as root if `target_post` has no parent (i.e., it *is* the root).
+                 if not thread_view_of_mentioned_post.parent: # target_post is the root
+                     root_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
+                 else: # Root is some other post, and we only have its URI. This is problematic.
+                       # Fallback: Use target_post as root if actual root CID is missing.
+                       logging.warning(f"Actual root URI {reply_root} lacks CID. Using triggering post {target_post.uri} as root instead.")
+                       root_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
 
-                    link_feature = at_models.AppBskyRichtextFacet.Link(uri=url)
-                    facet = at_models.AppBskyRichtextFacet.Main(
-                         index=at_models.AppBskyRichtextFacet.ByteSlice(byte_start=byte_start, byte_end=byte_end),
-                         features=[link_feature]
-                    )
-                    facets.append(facet)
-                    used_byte_ranges.append((byte_start, byte_end)) # Mark range as used
-                except Exception as e:
-                     logging.error(f"Unexpected error creating link facet for {url}: {e}", exc_info=True)
+        else: # Fallback if reply_root is not a PostView or URI string (e.g. a BlockedPost or NotFoundPost)
+            logging.warning(f"Root post {reply_root} is not a PostView. Using triggering post {target_post.uri} as root.")
+            root_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
 
+        parent_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
+        
+        # Send the reply post
+        logging.info(f"Sending reply to {mentioned_post_uri}: Text='{post_text[:50]}...', HasImage={image_data_bytes is not None}")
+        
+        # Make sure facets is None if empty, not an empty list, as per SDK expectations for some versions.
+        facets_to_send = facets if facets else None
 
-            # --- Step 3: Hashtags ---
-            # Regex for hashtags (simple version: # followed by word characters)
-            tag_regex = r'#(\w+)' # This regex was okay
-            for match in re.finditer(tag_regex, reply_text):
-                tag_with_hash = match.group(0)
-                tag_only = match.group(1)
-                
-                # Calculate byte indices
-                tag_bytes = tag_with_hash.encode('utf-8')
-                byte_start = reply_text_bytes.find(tag_bytes, match.start())
-                if byte_start != -1:
-                     byte_end = byte_start + len(tag_bytes)
-                else:
-                     logging.warning(f"Could not find byte offset for tag '{tag_with_hash}'. Skipping facet.")
-                     continue
-
-                # Check for overlap - skip if this range is already covered
-                if any(max(byte_start, r[0]) < min(byte_end, r[1]) for r in used_byte_ranges):
-                    logging.debug(f"Skipping tag facet for {tag_with_hash} due to overlap.")
-                    continue
-
-                logging.info(f"Found potential hashtag: {tag_with_hash} (bytes {byte_start}-{byte_end})")
-                try:
-                    tag_feature = at_models.AppBskyRichtextFacet.Tag(tag=tag_only)
-                    facet = at_models.AppBskyRichtextFacet.Main(
-                         index=at_models.AppBskyRichtextFacet.ByteSlice(byte_start=byte_start, byte_end=byte_end),
-                         features=[tag_feature]
-                    )
-                    facets.append(facet)
-                    used_byte_ranges.append((byte_start, byte_end)) # Mark range as used
-                except Exception as e:
-                    logging.error(f"Unexpected error creating tag facet for {tag_with_hash}: {e}", exc_info=True)
-
-
-        except Exception as e:
-            logging.error(f"Error during facet generation for {mentioned_post_uri}: {e}", exc_info=True)
-        # --- Facet Generation End ---
-
-        # Determine root and parent for the reply
-        parent_strong_ref = at_models.ComAtprotoRepoStrongRef.Main(uri=target_post.uri, cid=target_post.cid)
-        if target_post.record and isinstance(target_post.record, at_models.AppBskyFeedPost.Record) and target_post.record.reply:
-            root_ref_input = target_post.record.reply.root
-        else: 
-            root_ref_input = target_post
-        root_strong_ref = at_models.ComAtprotoRepoStrongRef.Main(uri=root_ref_input.uri, cid=root_ref_input.cid)
-        reply_ref = at_models.AppBskyFeedPost.ReplyRef(root=root_strong_ref, parent=parent_strong_ref)
-
-        try: # This was missing its except clauses
-            logging.info(f"Sending post in reply to {target_post.uri}...")
-            bsky_client.send_post(
-                text=reply_text,
-                reply_to=reply_ref,
-                facets=facets if facets else None,
-                embed=embed_to_send
-            )
-            logging.info(f"Successfully posted reply to {mentioned_post_uri}")
-        except AtProtocolError as e: # Added this except
-             logging.error(f"Bluesky API error sending post reply to {mentioned_post_uri}: {e}")
-        except Exception as e: # Added this except
-             logging.error(f"Unexpected error sending post reply to {mentioned_post_uri}: {e}", exc_info=True)
+        bsky_client.send_post(
+            text=post_text,
+            reply_to=at_models.AppBskyFeedPost.ReplyRef(root=root_ref, parent=parent_ref),
+            embed=embed_to_post, # This will be None if no image
+            facets=facets_to_send
+        )
+        logging.info(f"Successfully sent reply to {mentioned_post_uri}")
 
     except AtProtocolError as e:
-        logging.error(f"Bluesky API error during processing of {mentioned_post_uri}: {e}")
+        logging.error(f"Bluesky API error processing mention {mentioned_post_uri}: {e}")
     except Exception as e:
-        logging.error(f"Unexpected error while processing mention/reply {mentioned_post_uri}: {e}", exc_info=True)
+        logging.error(f"Unexpected error processing mention {mentioned_post_uri}: {e}", exc_info=True)
 
 
 def main_bot_loop():
-    """Main loop for the bot to check for mentions and reply."""
-    global bsky_client, last_processed_mention_ctime
-    
-    gemini_model = initialize_gemini_model()
-    if not gemini_model:
-        return # Exit if Gemini can't be initialized
+    """Main loop for the bot to check for mentions and process them."""
+    global bsky_client, gemini_model # Ensure access to initialized clients
 
-    if not bsky_client: # Should be initialized by main() before calling this
-        logging.error("Bluesky client not available in main loop.")
+    if not (bsky_client and gemini_model):
+        logging.critical("Bluesky client or Gemini model not initialized. Exiting main loop.")
         return
-
-    logging.info("Bot starting main loop...")
     
-    # Initialize last_processed_mention_ctime.
-    # For a more robust solution, this could be read from a file.
-    # For now, it starts as None, meaning all unread mentions up to limit will be processed on first run.
-    # After first run, it will be the timestamp of the latest processed mention.
-
+    logging.info("Bot starting main loop...")
     while True:
         try:
-            # Fetch notifications
-            # The `seenAt` parameter in list_notifications is for marking them as read,
-            # not for filtering. We need to filter by notification.indexedAt (ctime) ourselves.
-            # notifications_response = bsky_client.app.bsky.notification.list_notifications(limit=25) # Fetch recent 25
-            
-            # Use explicit Params object with updated limit
+            # Fetch notifications - no seenAt parameter, rely on isRead and updateSeen
             params = ListNotificationsParams(limit=NOTIFICATION_FETCH_LIMIT)
-            notifications_response = bsky_client.app.bsky.notification.list_notifications(params=params)
-            
-            # <<< START NEW DEBUG LOGGING >>>
-            logging.debug(f"Type of notifications_response: {type(notifications_response)}")
-            if notifications_response:
-                logging.debug(f"Notifications response object: {notifications_response}") # Log the whole object (might be verbose)
-                logging.debug(f"Does response have 'notifications' attribute? {hasattr(notifications_response, 'notifications')}")
-                if hasattr(notifications_response, 'notifications'):
-                    logging.debug(f"Value of notifications attribute: {notifications_response.notifications}")
-                    logging.debug(f"Type of notifications attribute: {type(notifications_response.notifications)}")
-                    logging.debug(f"Is notifications attribute None? {notifications_response.notifications is None}")
-                    if isinstance(notifications_response.notifications, list):
-                         logging.debug(f"Length of notifications list: {len(notifications_response.notifications)}")
-            else:
-                 logging.debug("Notifications response object is None or evaluates to False.")
-            # <<< END NEW DEBUG LOGGING >>>
-            
-            if not notifications_response or not notifications_response.notifications:
-                logging.debug("No new notifications found (or response/notifications attribute was empty/None).") # Updated log message
-                time.sleep(MENTION_CHECK_INTERVAL_SECONDS)
-                continue
+            response = bsky_client.app.bsky.notification.list_notifications(params=params)
 
-            # new_mentions_to_process = [] # Old list
-            mentions_to_process_with_ts = [] # New list to store (timestamp, mention) tuples
-            
-            # latest_ctime_in_batch = last_processed_mention_ctime # This wasn't used
+            if response and response.notifications:
+                latest_notification_indexed_at_in_batch = None # To track for updateSeen
 
-            logging.debug(f"Fetched {len(notifications_response.notifications)} notifications. Checking against last processed ctime: {last_processed_mention_ctime}")
+                # Sort by indexedAt to process older unread notifications first,
+                # and to correctly find the latest for updateSeen
+                sorted_notifications = sorted(response.notifications, key=lambda n: n.indexedAt)
 
-            for notification in notifications_response.notifications:
-                # Attempt to get indexedAt gracefully
-                indexed_at_value = None
-                raw_notification_data = {} # For logging if needed
-                try:
-                    # Try direct attribute access first (expected)
-                    if hasattr(notification, 'indexedAt') and isinstance(notification.indexedAt, str):
-                        indexed_at_value = notification.indexedAt
-                    else:
-                        # Fallback: Check underlying dict representation (common in pydantic models)
-                        raw_notification_data = notification.model_dump() # Use model_dump
-                        if isinstance(raw_notification_data.get('indexedAt'), str):
-                            indexed_at_value = raw_notification_data.get('indexedAt')
-                        elif isinstance(raw_notification_data.get('indexed_at'), str): # Check snake_case
-                             indexed_at_value = raw_notification_data.get('indexed_at')
+                for notification in sorted_notifications:
+                    # Update latest_notification_indexed_at_in_batch with the timestamp of every notification seen in this batch
+                    # This ensures updateSeen covers everything fetched, even if not processed (e.g. already read, or not a mention)
+                    if notification.indexedAt:
+                        if latest_notification_indexed_at_in_batch is None or notification.indexedAt > latest_notification_indexed_at_in_batch:
+                            latest_notification_indexed_at_in_batch = notification.indexedAt
+                    
+                    if notification.isRead:
+                        logging.debug(f"Skipping already read notification: {notification.uri}")
+                        continue
+
+                    # Skip if notification is from the bot itself to avoid loops or self-processing
+                    if notification.author.handle == BLUESKY_HANDLE:
+                        logging.info(f"Skipping notification {notification.uri} from bot ({BLUESKY_HANDLE}) itself.")
+                        continue
                         
-                except Exception as e:
-                     logging.warning(f"Error accessing notification data for {getattr(notification, 'uri', '[URI UNKNOWN]')}: {e}")
+                    if notification.reason in ['mention', 'reply']:
+                        # Pass the gemini_model directly
+                        process_mention(notification, gemini_model) 
+                    # else:
+                        # logging.debug(f"Skipping notification {notification.uri}: Reason '{notification.reason}' not 'mention' or 'reply'.")
 
-                logging.debug(f"Checking notification: URI={getattr(notification, 'uri', 'N/A')}, Reason={getattr(notification, 'reason', 'N/A')}, Author={getattr(notification.author, 'handle', 'N/A')}, Found IndexedAt='{indexed_at_value}'")
-
-                # Check 1: Valid indexedAt found?
-                if not indexed_at_value:
-                    logging.debug(f" -> Skipping notification {getattr(notification, 'cid', 'N/A')}: Could not find valid 'indexedAt' string field.")
-                    if raw_notification_data: # Log raw data if we tried accessing dict
-                         logging.debug(f"   Raw notification data: {raw_notification_data}")
-                    elif hasattr(notification, 'dict'):
-                         logging.debug(f"   Raw notification data (dict): {notification.dict()}")
-                    elif hasattr(notification, 'model_dump'):
-                         logging.debug(f"   Raw notification data (model_dump): {notification.model_dump()}")
-                    continue
-
-                # Check 2: Is it a mention OR a reply?
-                if notification.reason not in ['mention', 'reply']:
-                    logging.debug(f" -> Skipping notification {notification.uri}: reason is not 'mention' or 'reply' ({notification.reason}).")
-                    continue # Corrected indentation here
-
-                # Check 3: Is it newer than the last processed one?
-                current_indexed_at = indexed_at_value # Use the found value
-                is_new = last_processed_mention_ctime is None or current_indexed_at > last_processed_mention_ctime
-                logging.debug(f" -> Checking if new: Current IndexedAt={current_indexed_at}, Last Processed={last_processed_mention_ctime}, Is New={is_new}")
-                if not is_new:
-                    logging.debug(f" -> Skipping mention {notification.uri}: not newer than last processed.")
-                    continue
-
-                # Check 4: Is it a mention/reply *by* the bot itself?
-                if notification.author.handle == BLUESKY_HANDLE:
-                    logging.debug(f" -> Skipping notification {notification.uri}: notification author is the bot itself.")
-                    continue
-
-                # If all checks passed:
-                logging.debug(f" -> Adding new {notification.reason} from {notification.author.handle} ({current_indexed_at}) to process list: {notification.uri}")
-                # new_mentions_to_process.append(notification) # Old way
-                mentions_to_process_with_ts.append((current_indexed_at, notification)) # Store as tuple
-
-            # Process the found mentions (oldest first based on sort)
-            # new_mentions_to_process.sort(key=lambda n: n.indexedAt) # Old sort - caused error
-            mentions_to_process_with_ts.sort(key=lambda item: item[0]) # Sort by timestamp
-
-            if not mentions_to_process_with_ts:
-                 logging.debug(f"No mentions found in this batch meeting criteria (new and not self-mention). Last processed ctime: {last_processed_mention_ctime}")
-
-            # for mention in new_mentions_to_process: # Old iteration
-            for timestamp, mention in mentions_to_process_with_ts: # Iterate through sorted tuples
-                # Add logging at the start of process_mention as well
-                logging.info(f"Starting processing for mention: {mention.uri} (Timestamp: {timestamp})") 
-                process_mention(mention, gemini_model)
-                # Update last processed time
-                # Use the timestamp we already have from the tuple
-                if last_processed_mention_ctime is None or timestamp > last_processed_mention_ctime:
-                    last_processed_mention_ctime = timestamp
-            
-            if mentions_to_process_with_ts:
-                logging.info(f"Finished processing {len(mentions_to_process_with_ts)} new mentions. Last processed ctime updated to: {last_processed_mention_ctime}")
-            # else:
-                # logging.debug(f"No new, unread mentions found. Current last processed ctime: {last_processed_mention_ctime}") # Removed redundant log
-
-        except AtProtocolError as e:
-            # Attempt to access e.response and e.response.status_code carefully
-            status_code = None
-            if hasattr(e, 'response') and e.response and hasattr(e.response, 'status_code'):
-                status_code = e.response.status_code
-            
-            if status_code == 401: # Unauthorized
-                 logging.error(f"Bluesky authentication error: {e}. Attempting to re-login...")
-                 bsky_client = initialize_bluesky_client()
-                 if not bsky_client:
-                     logging.error("Re-login failed. Exiting.")
-                     break # Exit loop if re-login fails
+                # After processing all notifications in the batch, update seen status on server
+                if latest_notification_indexed_at_in_batch:
+                    try:
+                        bsky_client.app.bsky.notification.update_seen({'seenAt': latest_notification_indexed_at_in_batch})
+                        logging.info(f"Successfully called update_seen with server timestamp: {latest_notification_indexed_at_in_batch}")
+                        # No longer saving timestamp to file
+                    except Exception as e:
+                        logging.error(f"Error calling update_seen: {e}", exc_info=True)
             else:
-                logging.error(f"Bluesky API error in main loop: {e}")
-        except Exception as e:
-            logging.error(f"An unexpected error occurred in the main bot loop: {e}", exc_info=True)
+                logging.info("No new notifications found or error in fetching.")
         
-        logging.debug(f"Sleeping for {MENTION_CHECK_INTERVAL_SECONDS} seconds...")
+        except AtProtocolError as e:
+            logging.error(f"Bluesky API error in main loop: {e}")
+            if "ExpiredToken" in str(e) or "InvalidToken" in str(e):
+                logging.info("Attempting to re-login due to token error...")
+                bsky_client = initialize_bluesky_client() # Re-initialize
+                if not bsky_client:
+                    logging.error("Failed to re-login. Waiting before retrying...")
+                    time.sleep(60) # Wait longer if re-login fails
+        except Exception as e:
+            logging.error(f"Unexpected error in main loop: {e}", exc_info=True)
+
         time.sleep(MENTION_CHECK_INTERVAL_SECONDS)
 
+def main():
+    global bsky_client, gemini_model # Declare intent to modify globals
+
+    logging.info("Bot starting...")
+    
+    bsky_client = initialize_bluesky_client()
+    gemini_model = initialize_gemini_model()
+
+    # No initial update_seen call based on a loaded timestamp
+    if bsky_client and gemini_model:
+        main_bot_loop()
+    else:
+        if not bsky_client:
+            logging.error("Failed to initialize Bluesky client. Bot cannot start.")
+        if not gemini_model:
+            logging.error("Failed to initialize Gemini model. Bot cannot start.")
 
 if __name__ == "__main__":
-    logging.info("Bot starting...")
-    if not all([BLUESKY_HANDLE, BLUESKY_PASSWORD, GEMINI_API_KEY]):
-        logging.error("Missing one or more critical environment variables: BLUESKY_HANDLE, BLUESKY_PASSWORD, GEMINI_API_KEY. Exiting.")
-    else:
-        bsky_client = initialize_bluesky_client()
-        if bsky_client:
-            main_bot_loop()
-        else:
-            logging.error("Failed to initialize Bluesky client. Bot cannot start.")
-    logging.info("Bot shutting down.")
+    main()
