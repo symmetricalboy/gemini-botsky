@@ -6,6 +6,9 @@ from atproto import Client, models
 from atproto.exceptions import AtProtocolError
 import google.generativeai as genai
 
+# Import the specific Params model
+from atproto_client.models.app.bsky.notification.list_notifications import Params as ListNotificationsParams
+
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -214,7 +217,11 @@ def main_bot_loop():
             # Fetch notifications
             # The `seenAt` parameter in list_notifications is for marking them as read,
             # not for filtering. We need to filter by notification.indexedAt (ctime) ourselves.
-            notifications_response = bsky_client.app.bsky.notification.list_notifications(limit=25) # Fetch recent 25
+            # notifications_response = bsky_client.app.bsky.notification.list_notifications(limit=25) # Fetch recent 25
+            
+            # Try explicit Params object
+            params = ListNotificationsParams(limit=25)
+            notifications_response = bsky_client.app.bsky.notification.list_notifications(params=params)
             
             if not notifications_response or not notifications_response.notifications:
                 logging.debug("No new notifications found.")
