@@ -205,26 +205,52 @@ def clean_alt_text(text: str) -> str:
     # Search case-insensitively but preserve the case in the result
     lower_text = text.lower()
     
-    # If the text contains "alt_text:", extract the part after it
-    if "alt_text:" in lower_text:
-        index = lower_text.find("alt_text:")
-        return text[index + 9:].strip()  # 9 is the length of "alt_text:"
+    # Handle various "Alt text:" patterns
+    alt_text_patterns = [
+        "alt text:", "alt_text:", "alt-text:",
+        ". alt text:", ". alt_text:", ". alt-text:",
+        ", alt text:", ", alt_text:", ", alt-text:"
+    ]
     
-    # Check for text that looks like a description followed by an alt text label
-    # Example: "Cartoon style image of a cute AI sparkle character shaking hands with a friendly blue butterfly character. alt_text: An AI sparkle character and a blue butterfly cartoon character shaking hands."
+    # Find the earliest occurrence of any pattern
+    earliest_index = -1
+    earliest_pattern = None
     
-    # Look for ". alt_text:" pattern
-    period_index = lower_text.find(". alt_text:")
-    if period_index != -1:
-        return text[period_index + 11:].strip()  # 11 is the length of ". alt_text:"
+    for pattern in alt_text_patterns:
+        index = lower_text.find(pattern)
+        if index != -1 and (earliest_index == -1 or index < earliest_index):
+            earliest_index = index
+            earliest_pattern = pattern
     
-    # Look for ", alt_text:" pattern
-    comma_index = lower_text.find(", alt_text:")
-    if comma_index != -1:
-        return text[comma_index + 11:].strip()  # 11 is the length of ", alt_text:"
+    # If we found a pattern, extract the part after it
+    if earliest_index != -1:
+        # Get position after the pattern
+        start_pos = earliest_index + len(earliest_pattern)
+        return text[start_pos:].strip()
     
-    # For other cases, if the text is very long (likely a description with alt text combined),
-    # try to make it more concise
+    # Detect cases like "Description 1. Description 2." where the second part is redundant
+    # Look for patterns that suggest redundancy
+    if ". " in text and len(text) > 40:
+        sentences = text.split(". ")
+        if len(sentences) >= 2:
+            # Check if there might be redundancy by comparing sentence content
+            first_part = sentences[0].lower()
+            second_part = ". ".join(sentences[1:]).lower()
+            
+            # If sentences share significant words (indicator of redundancy)
+            first_words = set(word.strip(",.!?:;()[]{}\"'") for word in first_part.split() if len(word) > 4)
+            second_words = set(word.strip(",.!?:;()[]{}\"'") for word in second_part.split() if len(word) > 4)
+            
+            common_words = first_words.intersection(second_words)
+            
+            # If there's significant overlap, just use the shorter description
+            if len(common_words) >= 2 and len(common_words) >= min(len(first_words), len(second_words)) * 0.3:
+                if len(first_part) <= len(second_part):
+                    return sentences[0] + "."
+                else:
+                    return ". ".join(sentences[1:])
+    
+    # For other cases, if the text is very long, try to make it more concise
     if len(text) > 100:
         # Look for sentence boundaries to potentially shorten
         sentences = text.split('. ')
