@@ -14,6 +14,7 @@ import base64
 import json
 import requests
 from PIL import Image
+import psutil
 
 # Import the specific Params model
 from atproto_client.models.app.bsky.notification.list_notifications import Params as ListNotificationsParams
@@ -140,6 +141,7 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
 
                 # Check for embeds (images, videos, etc.)
                 embed_text = ""
+                image_urls = []
                 if current_view.post.embed:
                     if isinstance(current_view.post.embed, models.AppBskyEmbedImages.Main) or \
                        isinstance(current_view.post.embed, at_models.AppBskyEmbedImages.View):
@@ -149,11 +151,26 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
                         else: # at_models.AppBskyEmbedImages.View
                             images_to_check = current_view.post.embed.images
                         
+                        # First collect alt texts for display
                         for img in images_to_check:
                             if hasattr(img, 'alt') and img.alt:
                                 alt_texts.append(img.alt)
                             else:
                                 alt_texts.append("image") # Default if no alt text
+                        
+                        # Then collect image URLs
+                        for img in images_to_check:
+                            # Try different image URL attributes
+                            image_url = None
+                            for attr in ['fullsize', 'thumb', 'original', 'url']:
+                                if hasattr(img, attr) and getattr(img, attr):
+                                    image_url = getattr(img, attr)
+                                    break
+                            
+                            if image_url:
+                                image_urls.append(image_url)
+                                logging.info(f"Found image URL: {image_url}")
+                        
                         if alt_texts:
                             embed_text = f" [User attached: {', '.join(alt_texts)}]"
                         else:
@@ -177,7 +194,15 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
                          isinstance(current_view.post.embed, at_models.AppBskyEmbedRecordWithMedia.View):
                         embed_text = " [User quoted another post with media]"
 
-                history.append(f"{author_display_name} (@{current_view.post.author.handle}): {text}{embed_text}")
+                # Create the message entry with text and embed info
+                message = f"{author_display_name} (@{current_view.post.author.handle}): {text}{embed_text}"
+                
+                # If we have image URLs, add them as separate lines with a distinct marker for extraction later
+                if image_urls:
+                    for i, url in enumerate(image_urls):
+                        message += f"\n<<IMAGE_URL_{i+1}:{url}>>"
+                
+                history.append(message)
         elif isinstance(current_view, (models.AppBskyFeedDefs.NotFoundPost, models.AppBskyFeedDefs.BlockedPost)):
             logging.warning(f"Encountered NotFoundPost or BlockedPost while traversing thread parent: {current_view}")
             break 
@@ -369,6 +394,60 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         
         logging.debug(f"Generated full prompt for Gemini:\n{full_prompt_for_gemini}")
         
+        # Extract image URLs from thread context to send as separate parts
+        image_urls = []
+        image_url_pattern = r"<<IMAGE_URL_\d+:(https?://[^>]+)>>"
+        for match in re.finditer(image_url_pattern, thread_context):
+            url = match.group(1)
+            image_urls.append(url)
+        
+        # Limit number of images to process
+        MAX_IMAGES = 4
+        if len(image_urls) > MAX_IMAGES:
+            logging.warning(f"Too many images found ({len(image_urls)}). Limiting to {MAX_IMAGES}.")
+            image_urls = image_urls[:MAX_IMAGES]
+        
+        logging.info(f"Extracted {len(image_urls)} image URLs from the thread context")
+        
+        # Download images for Gemini with memory monitoring
+        start_memory = psutil.Process().memory_info().rss / 1024 / 1024
+        image_parts = []
+        
+        for url in image_urls:
+            # Check memory usage before downloading to prevent OOM errors
+            current_memory = psutil.Process().memory_info().rss / 1024 / 1024
+            if current_memory - start_memory > 100:  # If we've used more than 100MB, stop processing images
+                logging.warning(f"Memory usage increased by {current_memory - start_memory:.2f} MB. Stopping image processing.")
+                break
+                
+            image_bytes = download_image_from_url(url, max_size_mb=4.0, timeout=15)
+            if image_bytes:
+                try:
+                    # Convert to base64 for inline data
+                    b64_data = base64.b64encode(image_bytes).decode('utf-8')
+                    
+                    # Determine MIME type based on URL extension or default to jpeg
+                    mime_type = "image/jpeg"  # Default
+                    if url.lower().endswith(".png"):
+                        mime_type = "image/png"
+                    elif url.lower().endswith(".gif"):
+                        mime_type = "image/gif"
+                    
+                    # Create image part
+                    image_parts.append({
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": b64_data
+                        }
+                    })
+                    logging.info(f"Processed image for Gemini: {url}, size: {len(image_bytes) / 1024:.2f} KB")
+                except Exception as e:
+                    logging.error(f"Error processing image for Gemini: {e}")
+        
+        # Log final memory usage
+        end_memory = psutil.Process().memory_info().rss / 1024 / 1024
+        logging.info(f"Memory usage for image processing: {end_memory - start_memory:.2f} MB")
+        
         # Try to get a response from primary Gemini model
         primary_gemini_response_obj = None
         for attempt in range(MAX_GEMINI_RETRIES):
@@ -380,10 +459,18 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                     logging.info(f"Attempt {attempt + 1}: Using API call with TEXT response modality")
                     
                     # Create content object for the request
+                    parts = [{"text": full_prompt_for_gemini}]
+                    
+                    # Add image parts if available
+                    if image_parts:
+                        parts.extend(image_parts)
+                        logging.info(f"Added {len(image_parts)} images to the Gemini request")
+                    
+                    # Create the final content object
                     content = [
                         {
                             "role": "user",
-                            "parts": [{"text": full_prompt_for_gemini}]
+                            "parts": parts
                         }
                     ]
                     
@@ -391,14 +478,17 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                         content,
                         generation_config={"response_modalities": ["TEXT"]}
                     )
-                except Exception as e:
-                    logging.warning(f"Response modalities approach failed: {e}")
+                except Exception as api_e:
+                    logging.warning(f"Response modalities approach failed: {api_e}")
                     
-                    # Last resort: try a completely basic call
-                    logging.info(f"Attempt {attempt + 1}: Trying most basic call with no parameters")
-                    primary_gemini_response_obj = gemini_model_ref.generate_content(
-                        full_prompt_for_gemini
-                    )
+                    # Last resort: try a completely basic call, but only if no images
+                    if not image_parts:
+                        logging.info(f"Attempt {attempt + 1}: Trying most basic call with no parameters")
+                        primary_gemini_response_obj = gemini_model_ref.generate_content(
+                            full_prompt_for_gemini
+                        )
+                    else:
+                        raise api_e  # Re-raise if we have images as we can't use basic call
                 
                 # Process text from the primary model
                 if primary_gemini_response_obj.parts:
@@ -844,6 +934,56 @@ def compress_image(image_bytes, max_size_kb=950):
     
     logging.info(f"Final compression resulted in {final_size / 1024:.2f} KB image")
     return output.getvalue()
+
+def download_image_from_url(url: str, max_size_mb: float = 5.0, timeout: int = 10) -> bytes | None:
+    """
+    Downloads an image from a URL and returns the raw bytes.
+    Returns None if the download fails.
+    
+    Args:
+        url: The URL to download from
+        max_size_mb: Maximum size of the image in MB
+        timeout: Timeout in seconds for the request
+    """
+    try:
+        logging.info(f"Downloading image from URL: {url}")
+        response = requests.get(url, timeout=timeout, stream=True)
+        if response.status_code != 200:
+            logging.error(f"Failed to download image from {url}. Status code: {response.status_code}")
+            return None
+            
+        content_type = response.headers.get('Content-Type', '')
+        if not content_type.startswith('image/'):
+            logging.warning(f"URL does not contain an image. Content-Type: {content_type}")
+            return None
+        
+        # Get content length if available
+        content_length = response.headers.get('Content-Length')
+        if content_length and int(content_length) > max_size_mb * 1024 * 1024:
+            logging.warning(f"Image too large ({int(content_length) / (1024 * 1024):.2f} MB). Skipping download.")
+            return None
+            
+        # Download image with size monitoring
+        image_bytes = BytesIO()
+        total_size = 0
+        max_size_bytes = max_size_mb * 1024 * 1024
+        
+        for chunk in response.iter_content(chunk_size=8192):
+            total_size += len(chunk)
+            if total_size > max_size_bytes:
+                logging.warning(f"Image download exceeded max size of {max_size_mb} MB. Aborting.")
+                return None
+            image_bytes.write(chunk)
+        
+        final_bytes = image_bytes.getvalue()
+        logging.info(f"Successfully downloaded image. Size: {len(final_bytes) / 1024:.2f} KB")
+        return final_bytes
+    except requests.exceptions.Timeout:
+        logging.error(f"Timeout downloading image from {url} after {timeout} seconds")
+        return None
+    except Exception as e:
+        logging.error(f"Error downloading image from {url}: {e}")
+        return None
 
 def main_bot_loop():
     """Main loop for the bot to check for mentions and process them."""
