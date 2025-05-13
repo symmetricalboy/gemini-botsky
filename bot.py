@@ -90,28 +90,13 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         
-        # Define models that don't support system instructions
-        models_without_system_instruction = [
-            "gemini-2.0-flash-preview-image-generation"
-        ]
-        
+        # Since we're having compatibility issues, use the most basic model initialization
+        # without system instructions or other settings
         model_kwargs = {
             "model_name": GEMINI_MODEL_NAME,
-            "safety_settings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ],
-            "generation_config": {"max_output_tokens": 500} # Max output for the text model
         }
         
-        # Only add system instruction for supported models
-        if GEMINI_MODEL_NAME not in models_without_system_instruction:
-            model_kwargs["system_instruction"] = BOT_SYSTEM_INSTRUCTION
-            logging.info(f"Applied system instruction to model {GEMINI_MODEL_NAME}")
-        else:
-            logging.info(f"Model {GEMINI_MODEL_NAME} doesn't support system instructions, skipping")
+        logging.info(f"Initializing {GEMINI_MODEL_NAME} with basic configuration")
 
         model = genai.GenerativeModel(**model_kwargs)
         
@@ -351,28 +336,46 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         for attempt in range(MAX_GEMINI_RETRIES):
             try:
                 logging.info(f"Sending context to primary Gemini model ({GEMINI_MODEL_NAME}), attempt {attempt + 1}/{MAX_GEMINI_RETRIES} for {mentioned_post_uri}...")
-                # For older SDK versions, use direct parameters instead of 'config'
+                # Handle different versions of the Gemini SDK
                 try:
-                    # Try the newer SDK version first
-                    primary_gemini_response_obj = gemini_model_ref.generate_content(
-                        full_prompt_for_gemini,
-                        config=types.GenerateContentConfig(
-                            response_modalities=['IMAGE', 'TEXT']
-                        )
+                    # Attempt with direct JSON structure (following REST API example pattern)
+                    logging.info(f"Attempt {attempt + 1}: Using REST API pattern with generationConfig")
+                    
+                    # Create a direct request structure similar to the REST API
+                    request = {
+                        "model": GEMINI_MODEL_NAME,
+                        "contents": [{"parts": [{"text": full_prompt_for_gemini}]}],
+                        "generationConfig": {
+                            "responseModalities": ["TEXT", "IMAGE"],
+                            "temperature": 0.7,
+                            "maxOutputTokens": 800,
+                            "topP": 0.95,
+                            "topK": 64
+                        }
+                    }
+                    
+                    # Get raw client to send the request directly
+                    raw_client = gemini_model_ref._client._api_client
+                    response_json = raw_client.request(
+                        'post', 
+                        f'models/{GEMINI_MODEL_NAME}:generateContent',
+                        request
                     )
-                except TypeError as te:
-                    if "unexpected keyword argument 'config'" in str(te):
-                        logging.info("Falling back to older SDK version API style")
-                        # Fallback to older SDK version
+                    
+                    # Process raw response into expected format
+                    logging.info(f"Received raw response: {response_json}")
+                    primary_gemini_response_obj = gemini_model_ref._client._from_response(response_json)
+                    
+                except Exception as e1:
+                    logging.warning(f"Direct REST API pattern failed: {str(e1)}")
+                    try:
+                        # Fallback to basic API call as last resort
+                        logging.info(f"Attempt {attempt + 1}: Falling back to most basic API call")
                         primary_gemini_response_obj = gemini_model_ref.generate_content(
-                            full_prompt_for_gemini,
-                            generation_config=genai.types.GenerationConfig(
-                                response_mime_type="application/json"
-                            ),
-                            response_options={"response_modalities": ["IMAGE", "TEXT"]}
+                            full_prompt_for_gemini
                         )
-                    else:
-                        # Re-raise if it's a different TypeError
+                    except Exception as e2:
+                        logging.error(f"All API calling patterns failed in attempt {attempt + 1}. Errors: {str(e1)}, then {str(e2)}")
                         raise
                 
                 # Process text from the primary model
@@ -430,30 +433,46 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 try:
                     logging.info(f"Sending prompt to Imagen model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
                     
-                    # Use the generate_content method from the Gemini client
+                    # Try direct REST API approach for image generation
                     try:
-                        # Try the newer SDK version first
-                        imagen_response = imagen_client.models.generate_content(
-                            model=IMAGEN_MODEL_NAME,
-                            contents=image_prompt_for_imagen,
-                            config=types.GenerateContentConfig(
-                                response_modalities=['IMAGE', 'TEXT']
-                            )
+                        logging.info(f"Imagen Attempt {imagen_attempt + 1}: Using REST API pattern with generationConfig")
+                        
+                        # Create a direct request structure similar to the REST API
+                        request = {
+                            "model": IMAGEN_MODEL_NAME,
+                            "contents": [{"parts": [{"text": image_prompt_for_imagen}]}],
+                            "generationConfig": {
+                                "responseModalities": ["TEXT", "IMAGE"],
+                                "temperature": 0.7,
+                                "maxOutputTokens": 800,
+                                "topP": 0.95,
+                                "topK": 64
+                            }
+                        }
+                        
+                        # Get raw client to send the request directly
+                        raw_client = imagen_client._api_client
+                        response_json = raw_client.request(
+                            'post', 
+                            f'models/{IMAGEN_MODEL_NAME}:generateContent',
+                            request
                         )
-                    except TypeError as te:
-                        if "unexpected keyword argument 'config'" in str(te):
-                            logging.info("Falling back to older SDK version API style for image generation")
-                            # Fallback to older SDK version
+                        
+                        # Process raw response into expected format
+                        logging.info(f"Received raw image response: {response_json}")
+                        imagen_response = imagen_client.models._from_response(response_json)
+                        
+                    except Exception as e1:
+                        logging.warning(f"Direct REST API pattern for image failed: {str(e1)}")
+                        try:
+                            # Fallback to basic API call as last resort
+                            logging.info(f"Imagen Attempt {imagen_attempt + 1}: Falling back to most basic API call")
                             imagen_response = imagen_client.models.generate_content(
                                 model=IMAGEN_MODEL_NAME,
-                                contents=image_prompt_for_imagen,
-                                generation_config=genai.types.GenerationConfig(
-                                    response_mime_type="application/json"
-                                ),
-                                response_options={"response_modalities": ["IMAGE", "TEXT"]}
+                                contents=image_prompt_for_imagen
                             )
-                        else:
-                            # Re-raise if it's a different TypeError
+                        except Exception as e2:
+                            logging.error(f"All image generation API calling patterns failed. Errors: {str(e1)}, then {str(e2)}")
                             raise
                     
                     # Extract the image bytes from the response

@@ -26,49 +26,78 @@ def generate_image(prompt):
     """Generate an image using Gemini and save it locally."""
     print(f"Generating image with prompt: {prompt}")
     
-    # Generate content with both text and image modalities
+    # Use the REST API pattern with generationConfig
     try:
-        # Try the newer SDK version first
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=['IMAGE', 'TEXT']
-            )
+        # Create a direct request structure similar to the REST API
+        request = {
+            "model": MODEL_NAME,
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"],
+                "temperature": 0.7,
+                "maxOutputTokens": 800,
+                "topP": 0.95,
+                "topK": 64
+            }
+        }
+        
+        # Send request directly
+        raw_client = client._api_client
+        response_json = raw_client.request(
+            'post', 
+            f'models/{MODEL_NAME}:generateContent',
+            request
         )
-    except TypeError as te:
-        if "unexpected keyword argument 'config'" in str(te):
-            print("Falling back to older SDK version API style")
-            # Fallback to older SDK version
+        
+        # Extract response components
+        if 'candidates' in response_json and len(response_json['candidates']) > 0:
+            candidate = response_json['candidates'][0]
+            if 'content' in candidate and 'parts' in candidate['content']:
+                parts = candidate['content']['parts']
+                
+                # Process text parts
+                for part in parts:
+                    if 'text' in part:
+                        print(f"Model response text: {part['text']}")
+                    elif 'inlineData' in part and 'data' in part['inlineData']:
+                        # Convert base64 to image
+                        image_data = part['inlineData']['data']
+                        image_bytes = base64.b64decode(image_data)
+                        image = Image.open(BytesIO(image_bytes))
+                        filename = f"generated_image_{prompt[:20].replace(' ', '_').replace(':', '_')}.png"
+                        image.save(filename)
+                        print(f"Image saved as: {filename}")
+                        return True
+        
+        print("No image data found in the response")
+        return False
+    except Exception as e:
+        print(f"Error with REST API approach: {str(e)}")
+        # Fallback to basic call
+        try:
+            print("Falling back to basic API call")
             response = client.models.generate_content(
                 model=MODEL_NAME,
-                contents=prompt,
-                generation_config=genai.types.GenerationConfig(
-                    response_mime_type="application/json"
-                ),
-                response_options={"response_modalities": ["IMAGE", "TEXT"]}
+                contents=prompt
             )
-        else:
-            # Re-raise if it's a different TypeError
-            raise
-    
-    # Process the response
-    image_saved = False
-    for part in response.candidates[0].content.parts:
-        if part.text is not None:
-            print(f"Model response text: {part.text}")
-        elif part.inline_data is not None:
-            # Save the image
-            image = Image.open(BytesIO(part.inline_data.data))
-            filename = f"generated_image_{prompt[:20].replace(' ', '_').replace(':', '_')}.png"
-            image.save(filename)
-            print(f"Image saved as: {filename}")
-            image_saved = True
             
-    if not image_saved:
-        print("No image was generated in the response.")
-    
-    return image_saved
+            # Process the response
+            for part in response.candidates[0].content.parts:
+                if part.text is not None:
+                    print(f"Model response text: {part.text}")
+                elif part.inline_data is not None:
+                    # Save the image
+                    image = Image.open(BytesIO(part.inline_data.data))
+                    filename = f"generated_image_{prompt[:20].replace(' ', '_').replace(':', '_')}.png"
+                    image.save(filename)
+                    print(f"Image saved as: {filename}")
+                    return True
+            
+            print("No image was generated in the response.")
+            return False
+        except Exception as e2:
+            print(f"Both approaches failed: {str(e)}, then {str(e2)}")
+            return False
 
 def test_text_with_image_extraction():
     """Test extracting image prompts from text responses."""
@@ -87,47 +116,80 @@ def test_text_with_image_extraction():
     
     print(f"Sending prompt: {user_prompt}")
     
+    # Use the REST API pattern with generationConfig
     try:
-        # Try the newer SDK version first
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=full_prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=['IMAGE', 'TEXT']
-            )
+        # Create a direct request structure similar to the REST API
+        request = {
+            "model": MODEL_NAME,
+            "contents": [{"parts": [{"text": full_prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"],
+                "temperature": 0.7,
+                "maxOutputTokens": 800,
+                "topP": 0.95,
+                "topK": 64
+            }
+        }
+        
+        # Send request directly
+        raw_client = client._api_client
+        response_json = raw_client.request(
+            'post', 
+            f'models/{MODEL_NAME}:generateContent',
+            request
         )
-    except TypeError as te:
-        if "unexpected keyword argument 'config'" in str(te):
-            print("Falling back to older SDK version API style")
-            # Fallback to older SDK version
+        
+        text_response = ""
+        has_image = False
+        
+        # Extract response components
+        if 'candidates' in response_json and len(response_json['candidates']) > 0:
+            candidate = response_json['candidates'][0]
+            if 'content' in candidate and 'parts' in candidate['content']:
+                parts = candidate['content']['parts']
+                
+                # Process parts
+                for part in parts:
+                    if 'text' in part:
+                        text_response += part['text']
+                    elif 'inlineData' in part and 'data' in part['inlineData']:
+                        has_image = True
+                        # Convert base64 to image
+                        image_data = part['inlineData']['data']
+                        image_bytes = base64.b64decode(image_data)
+                        image = Image.open(BytesIO(image_bytes))
+                        filename = "generated_image_from_text_prompt.png"
+                        image.save(filename)
+                        print(f"Direct image generated and saved as: {filename}")
+    except Exception as e:
+        print(f"Error with REST API approach: {str(e)}")
+        # Fallback to basic call
+        try:
+            print("Falling back to basic API call")
             response = client.models.generate_content(
                 model=MODEL_NAME,
-                contents=full_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    response_mime_type="application/json"
-                ),
-                response_options={"response_modalities": ["IMAGE", "TEXT"]}
+                contents=full_prompt
             )
-        else:
-            # Re-raise if it's a different TypeError
-            raise
+            
+            # Process the response
+            text_response = ""
+            has_image = False
+            
+            for part in response.candidates[0].content.parts:
+                if part.text is not None:
+                    text_response += part.text
+                elif part.inline_data is not None:
+                    has_image = True
+                    # Save the image
+                    image = Image.open(BytesIO(part.inline_data.data))
+                    filename = "generated_image_from_text_prompt.png"
+                    image.save(filename)
+                    print(f"Direct image generated and saved as: {filename}")
+        except Exception as e2:
+            print(f"Both approaches failed: {str(e)}, then {str(e2)}")
+            return
     
-    # Process the response
-    has_image = False
-    text_response = ""
-    
-    # First check if there's an image directly in the response
-    for part in response.candidates[0].content.parts:
-        if part.text is not None:
-            text_response += part.text
-        elif part.inline_data is not None:
-            has_image = True
-            # Save the image
-            image = Image.open(BytesIO(part.inline_data.data))
-            filename = "generated_image_from_text_prompt.png"
-            image.save(filename)
-            print(f"Direct image generated and saved as: {filename}")
-    
+    # Process the text response
     if text_response:
         print(f"Text response: {text_response[:100]}...")
         
