@@ -353,6 +353,9 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 logging.info(f"Sending context to primary Gemini model ({GEMINI_MODEL_NAME}), attempt {attempt + 1}/{MAX_GEMINI_RETRIES} for {mentioned_post_uri}...")
                 primary_gemini_response_obj = gemini_model_ref.generate_content(
                     full_prompt_for_gemini,
+                    config=types.GenerateContentConfig(
+                        response_modalities=['IMAGE', 'TEXT']
+                    )
                 )
                 
                 # Process text from the primary model
@@ -415,7 +418,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                         model=IMAGEN_MODEL_NAME,
                         contents=image_prompt_for_imagen,
                         config=types.GenerateContentConfig(
-                            response_modalities=['TEXT', 'IMAGE']
+                            response_modalities=['IMAGE', 'TEXT']
                         )
                     )
                     

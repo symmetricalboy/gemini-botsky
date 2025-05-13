@@ -31,7 +31,7 @@ def generate_image(prompt):
         model=MODEL_NAME,
         contents=prompt,
         config=types.GenerateContentConfig(
-            response_modalities=['TEXT', 'IMAGE']
+            response_modalities=['IMAGE', 'TEXT']
         )
     )
     
@@ -74,7 +74,7 @@ def test_text_with_image_extraction():
         model=MODEL_NAME,
         contents=full_prompt,
         config=types.GenerateContentConfig(
-            response_modalities=['TEXT', 'IMAGE']
+            response_modalities=['IMAGE', 'TEXT']
         )
     )
     
