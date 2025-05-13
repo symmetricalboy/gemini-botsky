@@ -48,7 +48,7 @@ Constraints:
 *   CRITICAL: NEVER use placeholders (e.g., '[link]', '[info]', '[details]').
 *   If a user asks for specific factual information (like a URL, definition, or specific details) that you can reasonably provide, include the *actual* information directly. 
 *   Don't avoid taboo topics or having a bit of an opinion. Users understand that you are imperfect & may not say the exact right thing.
-*   If an image is requested or appropriate for the response, compose the textual part of your post, then on a NEW LINE, provide an image prompt starting with: `IMAGE_PROMPT: `."""
+*   ONLY generate an image if the user EXPLICITLY asks for one or requests a visual. Do not generate images for any other reason. If and only if a user explicitly requests an image, compose the textual part of your post, then on a NEW LINE, provide an image prompt starting with: `IMAGE_PROMPT: `."""
 MENTION_CHECK_INTERVAL_SECONDS = 60 # Default 60s is good for production
 MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # Maximum depth of thread to gather for context
 NOTIFICATION_FETCH_LIMIT = 100
@@ -390,7 +390,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             return
             
         # Construct the full prompt for the primary model
-        full_prompt_for_gemini = f"{BOT_SYSTEM_INSTRUCTION}\n\nYou are replying within a Bluesky conversation. The conversation history is provided below. Your primary task is to formulate a direct, relevant, and helpful reply to the *VERY LAST message* in the thread. Analyze the last message carefully. If it's a question, answer it. If it's a request, address it. Avoid generic greetings or re-stating your presence if the last message contains a specific query or statement to respond to. Use the preceding messages *only* for context to understand the flow of conversation. If you generate an image, you MUST also provide a concise and descriptive alt text for it, ideally in a separate text part or clearly marked. Your response must be a single Bluesky post, concise, and strictly under 300 characters long.\n\n---BEGIN THREAD CONTEXT---\n{thread_context}\n---END THREAD CONTEXT---"
+        full_prompt_for_gemini = f"{BOT_SYSTEM_INSTRUCTION}\n\nYou are replying within a Bluesky conversation. The conversation history is provided below. Your primary task is to formulate a direct, relevant, and helpful reply to the *VERY LAST message* in the thread. Analyze the last message carefully. If it's a question, answer it. If it's a request, address it. Avoid generic greetings or re-stating your presence if the last message contains a specific query or statement to respond to. Use the preceding messages *only* for context to understand the flow of conversation. CRITICAL: Only generate an image if the user's last message explicitly and clearly asks for an image, a picture, a visual, or something similar. If generating an image, you MUST also provide a concise and descriptive alt text for it. Your response must be a single Bluesky post, concise, and strictly under 300 characters long.\n\n---BEGIN THREAD CONTEXT---\n{thread_context}\n---END THREAD CONTEXT---"
         
         logging.debug(f"Generated full prompt for Gemini:\n{full_prompt_for_gemini}")
         
