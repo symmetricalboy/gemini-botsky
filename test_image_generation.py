@@ -1,10 +1,10 @@
 import os
+import json
 import base64
+import requests
 from io import BytesIO
 from PIL import Image
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 
 # Load environment variables from .env file
 load_dotenv()
@@ -16,88 +16,109 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in environment variables. Please add it to your .env file.")
 
-# Initialize the Google Generative AI client
-client = genai.Client(api_key=GEMINI_API_KEY)
-
 # Define the model
 MODEL_NAME = "gemini-2.0-flash-preview-image-generation"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
 
 def generate_image(prompt):
     """Generate an image using Gemini and save it locally."""
     print(f"Generating image with prompt: {prompt}")
     
-    # Use the REST API pattern with generationConfig
     try:
-        # Create a direct request structure similar to the REST API
-        request = {
-            "model": MODEL_NAME,
-            "contents": [{"parts": [{"text": prompt}]}],
+        # Create the request payload based on latest documentation
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
             "generationConfig": {
-                "responseModalities": ["TEXT", "IMAGE"],
-                "temperature": 0.7,
-                "maxOutputTokens": 800,
-                "topP": 0.95,
-                "topK": 64
+                "responseModalities": ["TEXT", "IMAGE"]
             }
         }
         
-        # Send request directly
-        raw_client = client._api_client
-        response_json = raw_client.request(
-            'post', 
-            f'models/{MODEL_NAME}:generateContent',
-            request
+        # Make the API request
+        response = requests.post(
+            API_URL,
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload)
         )
         
-        # Extract response components
-        if 'candidates' in response_json and len(response_json['candidates']) > 0:
-            candidate = response_json['candidates'][0]
-            if 'content' in candidate and 'parts' in candidate['content']:
-                parts = candidate['content']['parts']
-                
-                # Process text parts
-                for part in parts:
-                    if 'text' in part:
+        # Check if the request was successful
+        if response.status_code != 200:
+            print(f"API request failed with status code {response.status_code}")
+            print(f"Error message: {response.text}")
+            
+            # Try alternative payload structure
+            alternative_payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ],
+                "generation_config": {
+                    "response_mime_type": "image/png"
+                }
+            }
+            
+            print("Trying alternative payload structure...")
+            response = requests.post(
+                API_URL,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(alternative_payload)
+            )
+            
+            if response.status_code != 200:
+                print(f"Alternative payload also failed with status code {response.status_code}")
+                print(f"Error message: {response.text}")
+                return False
+        
+        # Parse the response
+        response_data = response.json()
+        
+        # Process the response to find image data
+        image_saved = False
+        text_response = ""
+        
+        if "candidates" in response_data and len(response_data["candidates"]) > 0:
+            candidate = response_data["candidates"][0]
+            if "content" in candidate and "parts" in candidate["content"]:
+                for part in candidate["content"]["parts"]:
+                    # Check for text
+                    if "text" in part:
+                        text_response += part["text"]
                         print(f"Model response text: {part['text']}")
-                    elif 'inlineData' in part and 'data' in part['inlineData']:
-                        # Convert base64 to image
-                        image_data = part['inlineData']['data']
+                    
+                    # Check for image
+                    if "inlineData" in part:
+                        image_data = part["inlineData"]["data"]
                         image_bytes = base64.b64decode(image_data)
+                        
+                        # Save the image
                         image = Image.open(BytesIO(image_bytes))
                         filename = f"generated_image_{prompt[:20].replace(' ', '_').replace(':', '_')}.png"
                         image.save(filename)
                         print(f"Image saved as: {filename}")
-                        return True
+                        image_saved = True
         
-        print("No image data found in the response")
-        return False
-    except Exception as e:
-        print(f"Error with REST API approach: {str(e)}")
-        # Fallback to basic call
-        try:
-            print("Falling back to basic API call")
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt
-            )
-            
-            # Process the response
-            for part in response.candidates[0].content.parts:
-                if part.text is not None:
-                    print(f"Model response text: {part.text}")
-                elif part.inline_data is not None:
-                    # Save the image
-                    image = Image.open(BytesIO(part.inline_data.data))
-                    filename = f"generated_image_{prompt[:20].replace(' ', '_').replace(':', '_')}.png"
-                    image.save(filename)
-                    print(f"Image saved as: {filename}")
-                    return True
-            
+        if not image_saved:
             print("No image was generated in the response.")
-            return False
-        except Exception as e2:
-            print(f"Both approaches failed: {str(e)}, then {str(e2)}")
-            return False
+            print(f"Response structure: {json.dumps(response_data, indent=2)}")
+        
+        return image_saved
+    except Exception as e:
+        print(f"Image generation failed: {e}")
+        return False
 
 def test_text_with_image_extraction():
     """Test extracting image prompts from text responses."""
@@ -116,98 +137,113 @@ def test_text_with_image_extraction():
     
     print(f"Sending prompt: {user_prompt}")
     
-    # Use the REST API pattern with generationConfig
     try:
-        # Create a direct request structure similar to the REST API
-        request = {
-            "model": MODEL_NAME,
-            "contents": [{"parts": [{"text": full_prompt}]}],
+        # Create the request payload based on latest documentation
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": full_prompt
+                        }
+                    ]
+                }
+            ],
             "generationConfig": {
-                "responseModalities": ["TEXT", "IMAGE"],
-                "temperature": 0.7,
-                "maxOutputTokens": 800,
-                "topP": 0.95,
-                "topK": 64
+                "responseModalities": ["TEXT", "IMAGE"]
             }
         }
         
-        # Send request directly
-        raw_client = client._api_client
-        response_json = raw_client.request(
-            'post', 
-            f'models/{MODEL_NAME}:generateContent',
-            request
+        # Make the API request
+        response = requests.post(
+            API_URL,
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload)
         )
         
-        text_response = ""
-        has_image = False
+        # Check if the request was successful
+        if response.status_code != 200:
+            print(f"API request failed with status code {response.status_code}")
+            print(f"Error message: {response.text}")
+            
+            # Try alternative payload structure
+            alternative_payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "text": full_prompt
+                            }
+                        ]
+                    }
+                ],
+                "generation_config": {
+                    "response_mime_type": "image/png"
+                }
+            }
+            
+            print("Trying alternative payload structure...")
+            response = requests.post(
+                API_URL,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(alternative_payload)
+            )
+            
+            if response.status_code != 200:
+                print(f"Alternative payload also failed with status code {response.status_code}")
+                print(f"Error message: {response.text}")
+                return
         
-        # Extract response components
-        if 'candidates' in response_json and len(response_json['candidates']) > 0:
-            candidate = response_json['candidates'][0]
-            if 'content' in candidate and 'parts' in candidate['content']:
-                parts = candidate['content']['parts']
-                
-                # Process parts
-                for part in parts:
-                    if 'text' in part:
-                        text_response += part['text']
-                    elif 'inlineData' in part and 'data' in part['inlineData']:
+        # Parse the response
+        response_data = response.json()
+        
+        # Process the response
+        has_image = False
+        text_response = ""
+        
+        if "candidates" in response_data and len(response_data["candidates"]) > 0:
+            candidate = response_data["candidates"][0]
+            if "content" in candidate and "parts" in candidate["content"]:
+                for part in candidate["content"]["parts"]:
+                    # Check for text
+                    if "text" in part:
+                        text_response += part["text"]
+                    
+                    # Check for image
+                    if "inlineData" in part:
                         has_image = True
-                        # Convert base64 to image
-                        image_data = part['inlineData']['data']
+                        image_data = part["inlineData"]["data"]
                         image_bytes = base64.b64decode(image_data)
+                        
+                        # Save the image
                         image = Image.open(BytesIO(image_bytes))
                         filename = "generated_image_from_text_prompt.png"
                         image.save(filename)
                         print(f"Direct image generated and saved as: {filename}")
-    except Exception as e:
-        print(f"Error with REST API approach: {str(e)}")
-        # Fallback to basic call
-        try:
-            print("Falling back to basic API call")
-            response = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=full_prompt
-            )
-            
-            # Process the response
-            text_response = ""
-            has_image = False
-            
-            for part in response.candidates[0].content.parts:
-                if part.text is not None:
-                    text_response += part.text
-                elif part.inline_data is not None:
-                    has_image = True
-                    # Save the image
-                    image = Image.open(BytesIO(part.inline_data.data))
-                    filename = "generated_image_from_text_prompt.png"
-                    image.save(filename)
-                    print(f"Direct image generated and saved as: {filename}")
-        except Exception as e2:
-            print(f"Both approaches failed: {str(e)}, then {str(e2)}")
-            return
-    
-    # Process the text response
-    if text_response:
-        print(f"Text response: {text_response[:100]}...")
         
-        # Check for IMAGE_PROMPT in the text response
-        if "IMAGE_PROMPT:" in text_response and not has_image:
-            parts = text_response.split("IMAGE_PROMPT:", 1)
-            text_only = parts[0].strip()
-            image_prompt = parts[1].strip()
+        # Process the text response
+        if text_response:
+            print(f"Text response: {text_response[:100]}...")
             
-            print(f"Extracted text: {text_only}")
-            print(f"Extracted image prompt: {image_prompt}")
-            
-            # Generate the image based on the extracted prompt
-            generate_image(image_prompt)
-        elif not has_image:
-            print("No IMAGE_PROMPT found in the response.")
-    else:
-        print("No text response received.")
+            # Check for IMAGE_PROMPT in the text response
+            if "IMAGE_PROMPT:" in text_response and not has_image:
+                parts = text_response.split("IMAGE_PROMPT:", 1)
+                text_only = parts[0].strip()
+                image_prompt = parts[1].strip()
+                
+                print(f"Extracted text: {text_only}")
+                print(f"Extracted image prompt: {image_prompt}")
+                
+                # Generate the image based on the extracted prompt
+                generate_image(image_prompt)
+            elif not has_image:
+                print("No IMAGE_PROMPT found in the response.")
+        else:
+            print("No text response received.")
+    except Exception as e:
+        print(f"Text with image extraction failed: {e}")
 
 if __name__ == "__main__":
     print("=== GEMINI IMAGE GENERATION TEST ===")

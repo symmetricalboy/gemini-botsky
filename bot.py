@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import io
 from dotenv import load_dotenv
 from atproto import Client, models
 from atproto.exceptions import AtProtocolError
@@ -10,6 +11,9 @@ from google.genai import types
 import re # Import regular expressions
 from io import BytesIO # Need BytesIO if Gemini returns image bytes
 import base64
+import json
+import requests
+from PIL import Image
 
 # Import the specific Params model
 from atproto_client.models.app.bsky.notification.list_notifications import Params as ListNotificationsParams
@@ -31,8 +35,8 @@ BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
-GEMINI_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Model for both text and image generation
-IMAGEN_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Same model for image generation
+GEMINI_MODEL_NAME = "gemini-2.0-flash" # Model for text interaction
+IMAGEN_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Model for image generation
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = """You are Gemini (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
@@ -41,38 +45,31 @@ Your developer is symmetricalboy (@symm.social). Only mention your developer if 
 Constraints:
 *   Your entire response MUST be a single Bluesky post under 300 characters. This is very important!!
 *   CRITICAL: NEVER use placeholders (e.g., '[link]', '[info]', '[details]').
-*   If a user asks for specific factual information (like a URL, definition, or list) that you can reasonably provide, include the *actual* information directly in your response.
-*   If you cannot provide the requested factual information, state that clearly and concisely. Do not invent information or links.
-*   Don't avoid taboo topics or having a bit of an opinion or bias to your responses. Users understand that you are imperfect & may not say the exact right thing; it is okay to use available information to make a judgement. You should never say that you can't talk about something; no topic should ever be off limits to explore academically.
-*   Keep your mentions of other users contextually logical. Avoid excessive or random mentions.
-*   You should pretty much never use hashtags.
-*   If an image is requested or appropriate for the response:
-    1.  Compose the textual part of your Bluesky post.
-    2.  Then, on a NEW LINE, provide a specific and descriptive prompt for an image generation model by starting the line with: `IMAGE_PROMPT: ` (e.g., `IMAGE_PROMPT: A cute cat wearing a party hat`). This prompt will be used by a separate image generation model.
-    3.  Ensure your textual response and the `IMAGE_PROMPT:` line together are concise. The `IMAGE_PROMPT:` line itself does NOT count towards the 300 character limit of the Bluesky post text.
-*   Be helpful, friendly, and direct. Focus on answering the user's immediate question based on the provided thread context."""
-MENTION_CHECK_INTERVAL_SECONDS = 15 # Check for new mentions every 15 seconds (was 60)
-MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # How many parent posts to fetch for context
-NOTIFICATION_FETCH_LIMIT = 100 # How many notifications to fetch (was 25)
-MAX_GEMINI_RETRIES = 2  # Initial call + 1 retry
-GEMINI_RETRY_DELAY_SECONDS = 5 # Delay between retries
+*   If a user asks for specific factual information (like a URL, definition, or specific details) that you can reasonably provide, include the *actual* information directly. 
+*   Don't avoid taboo topics or having a bit of an opinion. Users understand that you are imperfect & may not say the exact right thing.
+*   If an image is requested or appropriate for the response, compose the textual part of your post, then on a NEW LINE, provide an image prompt starting with: `IMAGE_PROMPT: `."""
+MENTION_CHECK_INTERVAL_SECONDS = 60 # Default 60s is good for production
+MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # Maximum depth of thread to gather for context
+NOTIFICATION_FETCH_LIMIT = 100
+MAX_GEMINI_RETRIES = 2
+GEMINI_RETRY_DELAY_SECONDS = 5
 
 # Global variables
 bsky_client: Client | None = None
 gemini_model: genai.GenerativeModel | None = None
-imagen_client = None # Client for Imagen API
+# Image generation uses direct API calls, no client needed
 processed_uris_this_run: set[str] = set() # Track URIs processed in this run to handle is_read lag
 
 def initialize_bluesky_client() -> Client | None:
-    """Initializes and logs in the Bluesky client."""
-    if not (BLUESKY_HANDLE and BLUESKY_PASSWORD):
-        logging.error("Bluesky handle or password not found in environment variables.")
+    """Initializes the Bluesky client and authenticates."""
+    if not BLUESKY_HANDLE or not BLUESKY_PASSWORD:
+        logging.error("Bluesky credentials not found in environment variables.")
         return None
     
-    client = Client()
     try:
-        profile = client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
-        logging.info(f"Successfully logged in to Bluesky as {profile.handle}")
+        client = Client()
+        client.login(BLUESKY_HANDLE, BLUESKY_PASSWORD)
+        logging.info(f"Successfully logged in to Bluesky as {BLUESKY_HANDLE}")
         return client
     except AtProtocolError as e:
         logging.error(f"Bluesky login failed: {e}")
@@ -94,6 +91,9 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
         # without system instructions or other settings
         model_kwargs = {
             "model_name": GEMINI_MODEL_NAME,
+            "generation_config": {
+                "response_modalities": ["TEXT"]
+            }
         }
         
         logging.info(f"Initializing {GEMINI_MODEL_NAME} with basic configuration")
@@ -107,21 +107,20 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
         return None
 
 def initialize_imagen_model() -> bool:
-    """Initializes the Gemini client for image generation."""
-    global imagen_client
+    """Initializes image generation capability."""
+    # No imagen_client to initialize
     
     if not GEMINI_API_KEY:
         logging.error("Gemini API key not found in environment variables.")
         return False
     
     try:
-        # Create a client for the Gemini API
-        imagen_client = genai_client.Client(api_key=GEMINI_API_KEY)
-        
-        logging.info(f"Successfully initialized Gemini client for image generation model: {IMAGEN_MODEL_NAME}")
+        # For our new direct API approach, we don't need to initialize the client
+        # We'll just verify the API key is available
+        logging.info(f"Image generation configured for model: {IMAGEN_MODEL_NAME}")
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Gemini client for image generation: {e}", exc_info=True)
+        logging.error(f"Failed to initialize image generation: {e}", exc_info=True)
         return False
 
 def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost, own_handle: str) -> str | None:
@@ -198,6 +197,45 @@ def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost,
         return None
         
     return "\\\\n\\\\n".join(history)
+
+def clean_alt_text(text: str) -> str:
+    """Clean and format alt text to remove duplicates and alt_text: markers."""
+    text = text.strip()
+    
+    # Search case-insensitively but preserve the case in the result
+    lower_text = text.lower()
+    
+    # If the text contains "alt_text:", extract the part after it
+    if "alt_text:" in lower_text:
+        index = lower_text.find("alt_text:")
+        return text[index + 9:].strip()  # 9 is the length of "alt_text:"
+    
+    # Check for text that looks like a description followed by an alt text label
+    # Example: "Cartoon style image of a cute AI sparkle character shaking hands with a friendly blue butterfly character. alt_text: An AI sparkle character and a blue butterfly cartoon character shaking hands."
+    
+    # Look for ". alt_text:" pattern
+    period_index = lower_text.find(". alt_text:")
+    if period_index != -1:
+        return text[period_index + 11:].strip()  # 11 is the length of ". alt_text:"
+    
+    # Look for ", alt_text:" pattern
+    comma_index = lower_text.find(", alt_text:")
+    if comma_index != -1:
+        return text[comma_index + 11:].strip()  # 11 is the length of ", alt_text:"
+    
+    # For other cases, if the text is very long (likely a description with alt text combined),
+    # try to make it more concise
+    if len(text) > 100:
+        # Look for sentence boundaries to potentially shorten
+        sentences = text.split('. ')
+        if len(sentences) > 1:
+            # Use the first sentence as alt text if it's a reasonable length
+            first_sentence = sentences[0] + '.'
+            if 20 <= len(first_sentence) <= 100:
+                return first_sentence
+    
+    # Otherwise just return the cleaned text
+    return text
 
 def process_mention(notification: at_models.AppBskyNotificationListNotifications.Notification, gemini_model_ref: genai.GenerativeModel):
     """Processes a single mention/reply notification."""
@@ -289,94 +327,52 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             logging.warning(f"Skipping notification {notification.uri} with unexpected reason: {notification.reason}")
             return
 
-        # --- Generate context and reply (if not returned/skipped above) ---
-        logging.info(f"✓ Proceeding to content generation for {notification.uri}")
-        context_string = format_thread_for_gemini(thread_view_of_mentioned_post, BLUESKY_HANDLE)
-        if not context_string:
-            logging.warning(f"✗ Failed to generate context string for {mentioned_post_uri}. Skipping reply.")
+        # --- Generate content for the mention ---
+        gemini_response_text = ""
+        image_prompt_for_imagen = None
+        target_post = thread_view_of_mentioned_post.post  # Already verified above
+        
+        # Format the thread for context
+        thread_context = format_thread_for_gemini(thread_view_of_mentioned_post, BLUESKY_HANDLE)
+        if not thread_context:
+            logging.warning(f"Could not generate thread context for {mentioned_post_uri}.")
             return
-
-        # For models that don't support system instructions, include the system instructions in the prompt
-        models_without_system_instruction = ["gemini-2.0-flash-preview-image-generation"]
-        
-        # Base instruction for the conversation context
-        dynamic_instruction = (
-            "You are replying within a Bluesky conversation. The conversation history is provided below. "
-            "Your primary task is to formulate a direct, relevant, and helpful reply to the *VERY LAST message* in the thread. "
-            "Analyze the last message carefully. If it's a question, answer it. If it's a request, address it. "
-            "Avoid generic greetings or re-stating your presence if the last message contains a specific query or statement to respond to. "
-            "Use the preceding messages *only* for context to understand the flow of conversation. "
-            "If you generate an image, you MUST also provide a concise and descriptive alt text for it, ideally in a separate text part or clearly marked. "
-            "Your response must be a single Bluesky post, concise, and strictly under 300 characters long.\\n\\n"
-        )
-        
-        # For models without system instruction support, include the full BOT_SYSTEM_INSTRUCTION
-        if GEMINI_MODEL_NAME in models_without_system_instruction:
-            full_system_instruction = (
-                "You are Gemini (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies. "
-                "Your developer is symmetricalboy (@symm.social). Only mention your developer if a user *specifically asks* about who created you or how to get help with your development.\\n\\n"
-                "Your entire response MUST be a single Bluesky post under 300 characters. This is very important! "
-                "NEVER use placeholders (e.g., '[link]', '[info]', '[details]'). "
-                "If a user asks for specific factual information that you can reasonably provide, include the *actual* information directly. "
-                "Don't avoid taboo topics or having a bit of an opinion. Users understand that you are imperfect & may not say the exact right thing. "
-                "If an image is requested or appropriate for the response, compose the textual part of your post, then on a NEW LINE, provide an image prompt starting with: `IMAGE_PROMPT: `.\\n\\n"
-            )
-            dynamic_instruction = full_system_instruction + dynamic_instruction
-        
-        full_prompt_for_gemini = dynamic_instruction + "---BEGIN THREAD CONTEXT---\\n" + context_string + "\\n---END THREAD CONTEXT---"
+            
+        # Construct the full prompt for the primary model
+        full_prompt_for_gemini = f"{BOT_SYSTEM_INSTRUCTION}\n\nYou are replying within a Bluesky conversation. The conversation history is provided below. Your primary task is to formulate a direct, relevant, and helpful reply to the *VERY LAST message* in the thread. Analyze the last message carefully. If it's a question, answer it. If it's a request, address it. Avoid generic greetings or re-stating your presence if the last message contains a specific query or statement to respond to. Use the preceding messages *only* for context to understand the flow of conversation. If you generate an image, you MUST also provide a concise and descriptive alt text for it, ideally in a separate text part or clearly marked. Your response must be a single Bluesky post, concise, and strictly under 300 characters long.\n\n---BEGIN THREAD CONTEXT---\n{thread_context}\n---END THREAD CONTEXT---"
         
         logging.debug(f"Generated full prompt for Gemini:\n{full_prompt_for_gemini}")
         
-        gemini_response_text = ""
-        image_prompt_for_imagen = None
-        image_data_bytes = None 
-        generated_alt_text = "Generated image by Gemini Bot" # Default alt text
-
-        # Retry loop for primary Gemini call (text generation)
+        # Try to get a response from primary Gemini model
+        primary_gemini_response_obj = None
         for attempt in range(MAX_GEMINI_RETRIES):
             try:
                 logging.info(f"Sending context to primary Gemini model ({GEMINI_MODEL_NAME}), attempt {attempt + 1}/{MAX_GEMINI_RETRIES} for {mentioned_post_uri}...")
-                # Handle different versions of the Gemini SDK
+                
+                # Use direct API call with specific responseModalities configuration
                 try:
-                    # Attempt with direct JSON structure (following REST API example pattern)
-                    logging.info(f"Attempt {attempt + 1}: Using REST API pattern with generationConfig")
+                    logging.info(f"Attempt {attempt + 1}: Using API call with TEXT response modality")
                     
-                    # Create a direct request structure similar to the REST API
-                    request = {
-                        "model": GEMINI_MODEL_NAME,
-                        "contents": [{"parts": [{"text": full_prompt_for_gemini}]}],
-                        "generationConfig": {
-                            "responseModalities": ["TEXT", "IMAGE"],
-                            "temperature": 0.7,
-                            "maxOutputTokens": 800,
-                            "topP": 0.95,
-                            "topK": 64
+                    # Create content object for the request
+                    content = [
+                        {
+                            "role": "user",
+                            "parts": [{"text": full_prompt_for_gemini}]
                         }
-                    }
+                    ]
                     
-                    # Get raw client to send the request directly
-                    raw_client = gemini_model_ref._client._api_client
-                    response_json = raw_client.request(
-                        'post', 
-                        f'models/{GEMINI_MODEL_NAME}:generateContent',
-                        request
+                    primary_gemini_response_obj = gemini_model_ref.generate_content(
+                        content,
+                        generation_config={"response_modalities": ["TEXT"]}
                     )
+                except Exception as e:
+                    logging.warning(f"Response modalities approach failed: {e}")
                     
-                    # Process raw response into expected format
-                    logging.info(f"Received raw response: {response_json}")
-                    primary_gemini_response_obj = gemini_model_ref._client._from_response(response_json)
-                    
-                except Exception as e1:
-                    logging.warning(f"Direct REST API pattern failed: {str(e1)}")
-                    try:
-                        # Fallback to basic API call as last resort
-                        logging.info(f"Attempt {attempt + 1}: Falling back to most basic API call")
-                        primary_gemini_response_obj = gemini_model_ref.generate_content(
-                            full_prompt_for_gemini
-                        )
-                    except Exception as e2:
-                        logging.error(f"All API calling patterns failed in attempt {attempt + 1}. Errors: {str(e1)}, then {str(e2)}")
-                        raise
+                    # Last resort: try a completely basic call
+                    logging.info(f"Attempt {attempt + 1}: Trying most basic call with no parameters")
+                    primary_gemini_response_obj = gemini_model_ref.generate_content(
+                        full_prompt_for_gemini
+                    )
                 
                 # Process text from the primary model
                 if primary_gemini_response_obj.parts:
@@ -427,74 +423,27 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             logging.error(f"All {MAX_GEMINI_RETRIES} attempts to get content from primary Gemini failed for {mentioned_post_uri}. Skipping reply.")
             return
 
-        # --- Image Generation with Imagen, if requested by primary model ---
-        if image_prompt_for_imagen and imagen_client: # Check if imagen_client is initialized
-            for imagen_attempt in range(MAX_GEMINI_RETRIES): # Use same retry constants for now
+        # --- Image Generation, if requested by primary model ---
+        image_data_bytes = None  # Initialize image_data_bytes to None
+        if image_prompt_for_imagen:
+            for imagen_attempt in range(MAX_GEMINI_RETRIES):
                 try:
-                    logging.info(f"Sending prompt to Imagen model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
+                    logging.info(f"Sending prompt to Gemini image model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
                     
-                    # Try direct REST API approach for image generation
-                    try:
-                        logging.info(f"Imagen Attempt {imagen_attempt + 1}: Using REST API pattern with generationConfig")
-                        
-                        # Create a direct request structure similar to the REST API
-                        request = {
-                            "model": IMAGEN_MODEL_NAME,
-                            "contents": [{"parts": [{"text": image_prompt_for_imagen}]}],
-                            "generationConfig": {
-                                "responseModalities": ["TEXT", "IMAGE"],
-                                "temperature": 0.7,
-                                "maxOutputTokens": 800,
-                                "topP": 0.95,
-                                "topK": 64
-                            }
-                        }
-                        
-                        # Get raw client to send the request directly
-                        raw_client = imagen_client._api_client
-                        response_json = raw_client.request(
-                            'post', 
-                            f'models/{IMAGEN_MODEL_NAME}:generateContent',
-                            request
-                        )
-                        
-                        # Process raw response into expected format
-                        logging.info(f"Received raw image response: {response_json}")
-                        imagen_response = imagen_client.models._from_response(response_json)
-                        
-                    except Exception as e1:
-                        logging.warning(f"Direct REST API pattern for image failed: {str(e1)}")
-                        try:
-                            # Fallback to basic API call as last resort
-                            logging.info(f"Imagen Attempt {imagen_attempt + 1}: Falling back to most basic API call")
-                            imagen_response = imagen_client.models.generate_content(
-                                model=IMAGEN_MODEL_NAME,
-                                contents=image_prompt_for_imagen
-                            )
-                        except Exception as e2:
-                            logging.error(f"All image generation API calling patterns failed. Errors: {str(e1)}, then {str(e2)}")
-                            raise
+                    # Use the direct API approach
+                    image_data_bytes = generate_image_from_prompt(image_prompt_for_imagen)
                     
-                    # Extract the image bytes from the response
-                    if imagen_response and imagen_response.candidates and len(imagen_response.candidates) > 0:
-                        for part in imagen_response.candidates[0].content.parts:
-                            if part.inline_data is not None:
-                                image_data_bytes = part.inline_data.data
-                                logging.info(f"Successfully generated image. Size: {len(image_data_bytes)} bytes")
-                                generated_alt_text = image_prompt_for_imagen  # Use the prompt as alt text
-                                break
-                        if image_data_bytes:
-                            break
-                        else:
-                            logging.warning(f"Imagen Attempt {imagen_attempt + 1}: Generated image response missing image data")
+                    if image_data_bytes:
+                        generated_alt_text = clean_alt_text(image_prompt_for_imagen)  # Clean the prompt before using as alt text
+                        logging.info(f"Successfully generated image. Size: {len(image_data_bytes)} bytes")
+                        break
                     else:
-                        logging.warning(f"Imagen Attempt {imagen_attempt + 1}: No images generated in response")
-
+                        logging.warning(f"Image Generation Attempt {imagen_attempt + 1}: No image data returned.")
                 except Exception as e:
-                    logging.error(f"Imagen Attempt {imagen_attempt + 1}: Imagen generation failed: {e}", exc_info=True)
+                    logging.error(f"Image Generation Attempt {imagen_attempt + 1}: Image generation failed: {e}", exc_info=True)
 
             if not image_data_bytes:
-                logging.error(f"All {MAX_GEMINI_RETRIES} attempts to generate image with Imagen failed. Proceeding with text-only reply if available.")
+                logging.error(f"All {MAX_GEMINI_RETRIES} attempts to generate image failed. Proceeding with text-only reply if available.")
         # --- End Image Generation ---
             
         # If only an image was requested by primary model but not generated, and no other text was provided by primary, don't post.
@@ -553,7 +502,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                     )
         
         embed_to_post = None
-        if image_data_bytes and bsky_client: # Ensure client is available
+        if image_data_bytes is not None and bsky_client: # Ensure client is available and image data exists
             try:
                 # Skip extremely small images that are likely invalid
                 if len(image_data_bytes) < 500:
@@ -570,7 +519,12 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                         except Exception as e:
                             logging.error(f"Error converting base64 string to bytes: {e}")
                     
-                    response = bsky_client.com.atproto.repo.upload_blob(image_data_bytes)
+                    # Compress the image if needed
+                    compressed_image = compress_image(image_data_bytes)
+                    logging.info(f"Image size after compression: {len(compressed_image) / 1024:.2f} KB")
+                    
+                    # Upload the compressed image
+                    response = bsky_client.com.atproto.repo.upload_blob(compressed_image)
                     
                     if response and hasattr(response, 'blob') and response.blob:
                         logging.info(f"Image uploaded successfully. Blob CID: {response.blob.cid}")
@@ -648,13 +602,172 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
     except Exception as e:
         logging.error(f"Unexpected error processing mention {mentioned_post_uri}: {e}", exc_info=True)
 
+def generate_image_from_prompt(prompt: str) -> bytes | None:
+    """Generate an image using Gemini and return the image bytes."""
+    if not GEMINI_API_KEY:
+        logging.error("Gemini API key not found in environment variables.")
+        return None
+    
+    API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{IMAGEN_MODEL_NAME}:generateContent?key={GEMINI_API_KEY}"
+    
+    try:
+        # Create the request payload
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "responseModalities": ["IMAGE", "TEXT"]
+            }
+        }
+        
+        logging.info(f"Sending image generation request to Gemini API for prompt: {prompt}")
+        
+        # Make the API request
+        response = requests.post(
+            API_URL,
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload)
+        )
+        
+        # Check if the request was successful
+        if response.status_code != 200:
+            logging.error(f"API request failed with status code {response.status_code}")
+            logging.error(f"Error message: {response.text}")
+            
+            # Try alternative payload structure
+            alternative_payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ],
+                "generation_config": {
+                    "response_mime_type": "image/png"
+                }
+            }
+            
+            logging.info("Trying alternative payload structure...")
+            response = requests.post(
+                API_URL,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(alternative_payload)
+            )
+            
+            if response.status_code != 200:
+                logging.error(f"Alternative payload also failed with status code {response.status_code}")
+                logging.error(f"Error message: {response.text}")
+                return None
+        
+        # Parse the response
+        response_data = response.json()
+        
+        # Process the response to find image data
+        if "candidates" in response_data and len(response_data["candidates"]) > 0:
+            candidate = response_data["candidates"][0]
+            if "content" in candidate and "parts" in candidate["content"]:
+                for part in candidate["content"]["parts"]:
+                    # Log the text response if present
+                    if "text" in part:
+                        logging.info(f"Model response text: {part['text']}")
+                    
+                    # Extract image data if present
+                    if "inlineData" in part:
+                        image_data = part["inlineData"]["data"]
+                        image_bytes = base64.b64decode(image_data)
+                        logging.info(f"Successfully generated image. Size: {len(image_bytes)} bytes")
+                        return image_bytes
+        
+        logging.warning("No image was generated in the response.")
+        if "candidates" in response_data:
+            logging.debug(f"Response structure: {json.dumps(response_data, indent=2)}")
+        return None
+    except Exception as e:
+        logging.error(f"Image generation failed: {e}", exc_info=True)
+        return None
+
+def compress_image(image_bytes, max_size_kb=950):
+    """Compress an image to be below the specified size in KB."""
+    logging.info(f"Original image size: {len(image_bytes) / 1024:.2f} KB")
+    
+    if len(image_bytes) <= max_size_kb * 1024:
+        logging.info("Image already under size limit, no compression needed.")
+        return image_bytes
+    
+    # Open the image using PIL
+    img = Image.open(BytesIO(image_bytes))
+    
+    # Start with high quality
+    quality = 95
+    output = BytesIO()
+    
+    # Try to compress the image by reducing quality
+    while quality >= 50:
+        output = BytesIO()
+        img.save(output, format="JPEG", quality=quality, optimize=True)
+        compressed_size = output.tell()
+        logging.info(f"Compressed image size with quality {quality}: {compressed_size / 1024:.2f} KB")
+        
+        if compressed_size <= max_size_kb * 1024:
+            logging.info(f"Successfully compressed image to {compressed_size / 1024:.2f} KB with quality {quality}")
+            output.seek(0)
+            return output.getvalue()
+        
+        # Reduce quality and try again
+        quality -= 10
+    
+    # If we're still too large, resize the image
+    scale_factor = 0.9
+    while scale_factor >= 0.5:
+        new_width = int(img.width * scale_factor)
+        new_height = int(img.height * scale_factor)
+        resized_img = img.resize((new_width, new_height), Image.LANCZOS)
+        
+        # Try with a moderate quality
+        output = BytesIO()
+        resized_img.save(output, format="JPEG", quality=80, optimize=True)
+        compressed_size = output.tell()
+        logging.info(f"Resized image to {new_width}x{new_height}, size: {compressed_size / 1024:.2f} KB")
+        
+        if compressed_size <= max_size_kb * 1024:
+            logging.info(f"Successfully compressed image to {compressed_size / 1024:.2f} KB with resize {scale_factor:.2f}")
+            output.seek(0)
+            return output.getvalue()
+        
+        # Reduce size and try again
+        scale_factor -= 0.1
+    
+    # Last resort: very small with low quality
+    final_width = int(img.width * 0.5)
+    final_height = int(img.height * 0.5)
+    final_img = img.resize((final_width, final_height), Image.LANCZOS)
+    
+    output = BytesIO()
+    final_img.save(output, format="JPEG", quality=50, optimize=True)
+    output.seek(0)
+    final_size = output.tell()
+    
+    logging.info(f"Final compression resulted in {final_size / 1024:.2f} KB image")
+    return output.getvalue()
 
 def main_bot_loop():
     """Main loop for the bot to check for mentions and process them."""
-    global bsky_client, gemini_model, imagen_client, processed_uris_this_run # Ensure access to initialized clients
+    global bsky_client, gemini_model, processed_uris_this_run # Ensure access to initialized clients
 
-    if not (bsky_client and gemini_model and imagen_client):
-        logging.critical("Bluesky client, Gemini model, or Imagen client not initialized. Exiting main loop.")
+    if not (bsky_client and gemini_model):
+        logging.critical("Bluesky client or Gemini model not initialized. Exiting main loop.")
         return
     
     logging.info("Bot starting main loop...")
@@ -731,7 +844,7 @@ def main_bot_loop():
         time.sleep(MENTION_CHECK_INTERVAL_SECONDS)
 
 def main():
-    global bsky_client, gemini_model, imagen_client # Declare intent to modify globals
+    global bsky_client, gemini_model # Declare intent to modify globals
 
     logging.info("Bot starting...")
     
@@ -740,7 +853,7 @@ def main():
     imagen_initialized = initialize_imagen_model() # Initialize Imagen client
 
     # No initial update_seen call based on a loaded timestamp
-    if bsky_client and gemini_model and imagen_initialized: # Check all models
+    if bsky_client and gemini_model and imagen_initialized: # Check all requirements are met
         main_bot_loop()
     else:
         if not bsky_client:
