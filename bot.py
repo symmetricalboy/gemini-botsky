@@ -490,6 +490,13 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         # Prepare post content (text, facets, embed)
         post_text = gemini_response_text.strip() if gemini_response_text else ""
         
+        # Ensure post text doesn't exceed Bluesky's character limit (300 chars)
+        BLUESKY_MAX_CHARS = 300
+        if len(post_text) > BLUESKY_MAX_CHARS:
+            logging.warning(f"Post text exceeds {BLUESKY_MAX_CHARS} characters ({len(post_text)}). Truncating.")
+            # Truncate to slightly less than the max to make room for ellipsis
+            post_text = post_text[:BLUESKY_MAX_CHARS-3] + "..."
+            
         facets = []
         if post_text: 
             # Mentions (ensure DID resolution for production)
@@ -500,32 +507,47 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 byte_start = len(post_text[:match.start()].encode('utf-8'))
                 byte_end = len(post_text[:match.end()].encode('utf-8'))
                 
-                # Placeholder DID - resolve to actual DID in a real application
-                # resolved_did = resolve_handle_to_did(handle) # You'd need this function
-                # if resolved_did:
-                facets.append(
-                    at_models.AppBskyRichtextFacet.Main(
-                        index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=byte_start, byteEnd=byte_end),
-                        features=[at_models.AppBskyRichtextFacet.Mention(did=f"did:plc:{handle}")] # Replace with resolved_did
-                    )
-                )
+                try:
+                    # Attempt to resolve the handle to a DID (simplified for now)
+                    # In a real implementation, you would use proper handle resolution
+                    # For now, just validate the handle format to avoid malformed DIDs
+                    if re.match(r'^[a-zA-Z0-9_.-]+(?:\.[a-zA-Z0-9]+)+$', handle):
+                        facets.append(
+                            at_models.AppBskyRichtextFacet.Main(
+                                index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=byte_start, byteEnd=byte_end),
+                                features=[at_models.AppBskyRichtextFacet.Mention(did=f"did:plc:{handle}")] # Replace with resolved_did
+                            )
+                        )
+                        logging.info(f"Added mention facet for handle: @{handle}")
+                    else:
+                        logging.warning(f"Skipping invalid handle format: @{handle}")
+                except Exception as e:
+                    logging.warning(f"Error creating mention facet for @{handle}: {e}")
+                    # Skip this facet rather than failing the whole post
             
             # Links (more robust regex)
             url_pattern = r'https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)'
             for match in re.finditer(url_pattern, post_text):
                 uri = match.group(0) # group(0) gets the entire match
-                # Validate if URI is well-formed before adding facet (optional, basic check here)
-                if "://" in uri: # Simple check to ensure it looks like a protocol URI
-                    # Calculate byte offsets correctly
-                    byte_start = len(post_text[:match.start()].encode('utf-8'))
-                    byte_end = len(post_text[:match.end()].encode('utf-8'))
+                try:
+                    # Validate if URI is well-formed before adding facet (optional, basic check here)
+                    if "://" in uri and len(uri) <= 2048: # Simple check to ensure it looks like a protocol URI with reasonable length
+                        # Calculate byte offsets correctly
+                        byte_start = len(post_text[:match.start()].encode('utf-8'))
+                        byte_end = len(post_text[:match.end()].encode('utf-8'))
 
-                    facets.append(
-                        at_models.AppBskyRichtextFacet.Main(
-                            index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=byte_start, byteEnd=byte_end),
-                            features=[at_models.AppBskyRichtextFacet.Link(uri=uri)]
+                        facets.append(
+                            at_models.AppBskyRichtextFacet.Main(
+                                index=at_models.AppBskyRichtextFacet.ByteSlice(byteStart=byte_start, byteEnd=byte_end),
+                                features=[at_models.AppBskyRichtextFacet.Link(uri=uri)]
+                            )
                         )
-                    )
+                        logging.info(f"Added link facet for URI: {uri}")
+                    else:
+                        logging.warning(f"Skipping invalid or oversized URI: {uri}")
+                except Exception as e:
+                    logging.warning(f"Error creating link facet for {uri}: {e}")
+                    # Skip this facet rather than failing the whole post
         
         embed_to_post = None
         if image_data_bytes is not None and bsky_client: # Ensure client is available and image data exists
@@ -590,6 +612,15 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         if root_ref is None:
             root_ref = parent_ref # Use the target_post's StrongRef as the root
             logging.debug(f"Target post {target_post.uri} is not a reply (or root ref missing). Using target post as root.")
+            
+        # Validate the root and parent references
+        root_valid = hasattr(root_ref, 'uri') and hasattr(root_ref, 'cid') and root_ref.uri and root_ref.cid
+        parent_valid = hasattr(parent_ref, 'uri') and hasattr(parent_ref, 'cid') and parent_ref.uri and parent_ref.cid
+        
+        if not root_valid or not parent_valid:
+            logging.error(f"Invalid root or parent reference. Root valid: {root_valid}, Parent valid: {parent_valid}")
+            logging.error(f"Root: {root_ref}, Parent: {parent_ref}")
+            return  # Skip this post rather than sending an invalid reference
         # --- End Determine Root and Parent --- 
         
         # Send the reply post
@@ -611,6 +642,21 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                         if hasattr(img, 'image') and img.image:
                             logging.info(f"Image {idx+1} blob info: type={type(img.image).__name__}, has cid={hasattr(img.image, 'cid')}")
             
+            # Debug log the complete request data
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                debug_data = {
+                    "text": post_text,
+                    "text_length": len(post_text),
+                    "root_uri": root_ref.uri if hasattr(root_ref, 'uri') else None,
+                    "root_cid": root_ref.cid if hasattr(root_ref, 'cid') else None,
+                    "parent_uri": parent_ref.uri if hasattr(parent_ref, 'uri') else None,
+                    "parent_cid": parent_ref.cid if hasattr(parent_ref, 'cid') else None,
+                    "has_embed": embed_to_post is not None,
+                    "embed_type": type(embed_to_post).__name__ if embed_to_post else None,
+                    "facets_count": len(facets) if facets else 0
+                }
+                logging.debug(f"Complete post parameters: {json.dumps(debug_data, indent=2)}")
+            
             response = bsky_client.send_post(
                 text=post_text,
                 reply_to=at_models.AppBskyFeedPost.ReplyRef(root=root_ref, parent=parent_ref),
@@ -620,6 +666,17 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             
             logging.info(f"Post creation response: {response}")
             logging.info(f"Successfully sent reply to {mentioned_post_uri}")
+        except AtProtocolError as api_error:
+            error_msg = str(api_error)
+            logging.error(f"Bluesky API error creating post: {error_msg}", exc_info=True)
+            # Log detailed information about the request that failed
+            logging.error(f"Failed post details - Text: '{post_text}', Text length: {len(post_text)}")
+            if "BlobTooLarge" in error_msg:
+                logging.error("Image blob too large for Bluesky. Try reducing image quality or dimensions.")
+            elif "InvalidRequest" in error_msg:
+                logging.error("Invalid request format. Check facets, embed structure, or text content.")
+            elif "RateLimitExceeded" in error_msg:
+                logging.error("Rate limit exceeded. Bot may be posting too frequently.")
         except Exception as post_error:
             logging.error(f"Error creating post: {post_error}", exc_info=True)
 
