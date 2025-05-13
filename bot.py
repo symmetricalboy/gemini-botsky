@@ -351,12 +351,29 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         for attempt in range(MAX_GEMINI_RETRIES):
             try:
                 logging.info(f"Sending context to primary Gemini model ({GEMINI_MODEL_NAME}), attempt {attempt + 1}/{MAX_GEMINI_RETRIES} for {mentioned_post_uri}...")
-                primary_gemini_response_obj = gemini_model_ref.generate_content(
-                    full_prompt_for_gemini,
-                    config=types.GenerateContentConfig(
-                        response_modalities=['IMAGE', 'TEXT']
+                # For older SDK versions, use direct parameters instead of 'config'
+                try:
+                    # Try the newer SDK version first
+                    primary_gemini_response_obj = gemini_model_ref.generate_content(
+                        full_prompt_for_gemini,
+                        config=types.GenerateContentConfig(
+                            response_modalities=['IMAGE', 'TEXT']
+                        )
                     )
-                )
+                except TypeError as te:
+                    if "unexpected keyword argument 'config'" in str(te):
+                        logging.info("Falling back to older SDK version API style")
+                        # Fallback to older SDK version
+                        primary_gemini_response_obj = gemini_model_ref.generate_content(
+                            full_prompt_for_gemini,
+                            generation_config=genai.types.GenerationConfig(
+                                response_mime_type="application/json"
+                            ),
+                            response_options={"response_modalities": ["IMAGE", "TEXT"]}
+                        )
+                    else:
+                        # Re-raise if it's a different TypeError
+                        raise
                 
                 # Process text from the primary model
                 if primary_gemini_response_obj.parts:
@@ -414,13 +431,30 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                     logging.info(f"Sending prompt to Imagen model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
                     
                     # Use the generate_content method from the Gemini client
-                    imagen_response = imagen_client.models.generate_content(
-                        model=IMAGEN_MODEL_NAME,
-                        contents=image_prompt_for_imagen,
-                        config=types.GenerateContentConfig(
-                            response_modalities=['IMAGE', 'TEXT']
+                    try:
+                        # Try the newer SDK version first
+                        imagen_response = imagen_client.models.generate_content(
+                            model=IMAGEN_MODEL_NAME,
+                            contents=image_prompt_for_imagen,
+                            config=types.GenerateContentConfig(
+                                response_modalities=['IMAGE', 'TEXT']
+                            )
                         )
-                    )
+                    except TypeError as te:
+                        if "unexpected keyword argument 'config'" in str(te):
+                            logging.info("Falling back to older SDK version API style for image generation")
+                            # Fallback to older SDK version
+                            imagen_response = imagen_client.models.generate_content(
+                                model=IMAGEN_MODEL_NAME,
+                                contents=image_prompt_for_imagen,
+                                generation_config=genai.types.GenerationConfig(
+                                    response_mime_type="application/json"
+                                ),
+                                response_options={"response_modalities": ["IMAGE", "TEXT"]}
+                            )
+                        else:
+                            # Re-raise if it's a different TypeError
+                            raise
                     
                     # Extract the image bytes from the response
                     if imagen_response and imagen_response.candidates and len(imagen_response.candidates) > 0:

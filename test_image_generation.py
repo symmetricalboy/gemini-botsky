@@ -27,13 +27,30 @@ def generate_image(prompt):
     print(f"Generating image with prompt: {prompt}")
     
     # Generate content with both text and image modalities
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=['IMAGE', 'TEXT']
+    try:
+        # Try the newer SDK version first
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=['IMAGE', 'TEXT']
+            )
         )
-    )
+    except TypeError as te:
+        if "unexpected keyword argument 'config'" in str(te):
+            print("Falling back to older SDK version API style")
+            # Fallback to older SDK version
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                generation_config=genai.types.GenerationConfig(
+                    response_mime_type="application/json"
+                ),
+                response_options={"response_modalities": ["IMAGE", "TEXT"]}
+            )
+        else:
+            # Re-raise if it's a different TypeError
+            raise
     
     # Process the response
     image_saved = False
@@ -70,13 +87,30 @@ def test_text_with_image_extraction():
     
     print(f"Sending prompt: {user_prompt}")
     
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=full_prompt,
-        config=types.GenerateContentConfig(
-            response_modalities=['IMAGE', 'TEXT']
+    try:
+        # Try the newer SDK version first
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=full_prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=['IMAGE', 'TEXT']
+            )
         )
-    )
+    except TypeError as te:
+        if "unexpected keyword argument 'config'" in str(te):
+            print("Falling back to older SDK version API style")
+            # Fallback to older SDK version
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    response_mime_type="application/json"
+                ),
+                response_options={"response_modalities": ["IMAGE", "TEXT"]}
+            )
+        else:
+            # Re-raise if it's a different TypeError
+            raise
     
     # Process the response
     has_image = False
