@@ -31,8 +31,8 @@ BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Environment Variables
-GEMINI_MODEL_NAME = "gemini-2.5-pro-preview-05-06" # Primary model for text and system instructions
-IMAGEN_MODEL_NAME = "imagen-3.0-generate-002" # Updated to use Imagen 3 model
+GEMINI_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Model for both text and image generation
+IMAGEN_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Same model for image generation
 
 # Constants
 BOT_SYSTEM_INSTRUCTION = """You are Gemini (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
@@ -111,21 +111,21 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
         return None
 
 def initialize_imagen_model() -> bool:
-    """Initializes the Imagen client for image generation."""
+    """Initializes the Gemini client for image generation."""
     global imagen_client
     
     if not GEMINI_API_KEY:
-        logging.error("Gemini API key (for Imagen) not found in environment variables.")
+        logging.error("Gemini API key not found in environment variables.")
         return False
     
     try:
-        # Create a client for the Imagen API
+        # Create a client for the Gemini API
         imagen_client = genai_client.Client(api_key=GEMINI_API_KEY)
         
-        logging.info(f"Successfully initialized Imagen 3 client for model: {IMAGEN_MODEL_NAME}")
+        logging.info(f"Successfully initialized Gemini client for image generation model: {IMAGEN_MODEL_NAME}")
         return True
     except Exception as e:
-        logging.error(f"Failed to initialize Imagen client: {e}", exc_info=True)
+        logging.error(f"Failed to initialize Gemini client for image generation: {e}", exc_info=True)
         return False
 
 def format_thread_for_gemini(thread_view: models.AppBskyFeedDefs.ThreadViewPost, own_handle: str) -> str | None:
@@ -382,26 +382,24 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                 try:
                     logging.info(f"Sending prompt to Imagen model ({IMAGEN_MODEL_NAME}), attempt {imagen_attempt + 1}/{MAX_GEMINI_RETRIES} for image prompt: '{image_prompt_for_imagen}'")
                     
-                    # Use the generate_images method from the Imagen client
-                    imagen_response = imagen_client.models.generate_images(
+                    # Use the generate_content method from the Gemini client
+                    imagen_response = imagen_client.models.generate_content(
                         model=IMAGEN_MODEL_NAME,
-                        prompt=image_prompt_for_imagen,
-                        config=types.GenerateImagesConfig(
-                            number_of_images=1,
-                            aspect_ratio="1:1",  # Square format for Bluesky
-                            safety_filter_level="BLOCK_MEDIUM_AND_ABOVE",
-                            person_generation="ALLOW_ADULT",
+                        contents=image_prompt_for_imagen,
+                        config=types.GenerateContentConfig(
+                            response_modalities=['TEXT', 'IMAGE']
                         )
                     )
                     
                     # Extract the image bytes from the response
-                    if imagen_response and imagen_response.generated_images and len(imagen_response.generated_images) > 0:
-                        # Get the first generated image
-                        generated_image = imagen_response.generated_images[0]
-                        if generated_image and generated_image.image and generated_image.image.image_bytes:
-                            image_data_bytes = generated_image.image.image_bytes
-                            logging.info(f"Successfully generated image. Size: {len(image_data_bytes)} bytes")
-                            generated_alt_text = image_prompt_for_imagen  # Use the prompt as alt text
+                    if imagen_response and imagen_response.candidates and len(imagen_response.candidates) > 0:
+                        for part in imagen_response.candidates[0].content.parts:
+                            if part.inline_data is not None:
+                                image_data_bytes = part.inline_data.data
+                                logging.info(f"Successfully generated image. Size: {len(image_data_bytes)} bytes")
+                                generated_alt_text = image_prompt_for_imagen  # Use the prompt as alt text
+                                break
+                        if image_data_bytes:
                             break
                         else:
                             logging.warning(f"Imagen Attempt {imagen_attempt + 1}: Generated image response missing image data")
