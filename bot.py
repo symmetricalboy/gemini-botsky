@@ -90,9 +90,13 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         
+        # Define models that don't support system instructions
+        models_without_system_instruction = [
+            "gemini-2.0-flash-preview-image-generation"
+        ]
+        
         model_kwargs = {
             "model_name": GEMINI_MODEL_NAME,
-            "system_instruction": BOT_SYSTEM_INSTRUCTION, # Always use system instruction
             "safety_settings": [
                 {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                 {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -101,6 +105,13 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
             ],
             "generation_config": {"max_output_tokens": 500} # Max output for the text model
         }
+        
+        # Only add system instruction for supported models
+        if GEMINI_MODEL_NAME not in models_without_system_instruction:
+            model_kwargs["system_instruction"] = BOT_SYSTEM_INSTRUCTION
+            logging.info(f"Applied system instruction to model {GEMINI_MODEL_NAME}")
+        else:
+            logging.info(f"Model {GEMINI_MODEL_NAME} doesn't support system instructions, skipping")
 
         model = genai.GenerativeModel(**model_kwargs)
         
@@ -300,6 +311,10 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             logging.warning(f"✗ Failed to generate context string for {mentioned_post_uri}. Skipping reply.")
             return
 
+        # For models that don't support system instructions, include the system instructions in the prompt
+        models_without_system_instruction = ["gemini-2.0-flash-preview-image-generation"]
+        
+        # Base instruction for the conversation context
         dynamic_instruction = (
             "You are replying within a Bluesky conversation. The conversation history is provided below. "
             "Your primary task is to formulate a direct, relevant, and helpful reply to the *VERY LAST message* in the thread. "
@@ -308,9 +323,22 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             "Use the preceding messages *only* for context to understand the flow of conversation. "
             "If you generate an image, you MUST also provide a concise and descriptive alt text for it, ideally in a separate text part or clearly marked. "
             "Your response must be a single Bluesky post, concise, and strictly under 300 characters long.\\n\\n"
-            "---BEGIN THREAD CONTEXT---\\n"
         )
-        full_prompt_for_gemini = dynamic_instruction + context_string + "\\n---END THREAD CONTEXT---"
+        
+        # For models without system instruction support, include the full BOT_SYSTEM_INSTRUCTION
+        if GEMINI_MODEL_NAME in models_without_system_instruction:
+            full_system_instruction = (
+                "You are Gemini (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies. "
+                "Your developer is symmetricalboy (@symm.social). Only mention your developer if a user *specifically asks* about who created you or how to get help with your development.\\n\\n"
+                "Your entire response MUST be a single Bluesky post under 300 characters. This is very important! "
+                "NEVER use placeholders (e.g., '[link]', '[info]', '[details]'). "
+                "If a user asks for specific factual information that you can reasonably provide, include the *actual* information directly. "
+                "Don't avoid taboo topics or having a bit of an opinion. Users understand that you are imperfect & may not say the exact right thing. "
+                "If an image is requested or appropriate for the response, compose the textual part of your post, then on a NEW LINE, provide an image prompt starting with: `IMAGE_PROMPT: `.\\n\\n"
+            )
+            dynamic_instruction = full_system_instruction + dynamic_instruction
+        
+        full_prompt_for_gemini = dynamic_instruction + "---BEGIN THREAD CONTEXT---\\n" + context_string + "\\n---END THREAD CONTEXT---"
         
         logging.debug(f"Generated full prompt for Gemini:\n{full_prompt_for_gemini}")
         
