@@ -51,7 +51,7 @@ Constraints:
 *   ONLY generate an image if the user EXPLICITLY asks for one or requests a visual. Do not generate images for any other reason. If and only if a user explicitly requests an image, compose the textual part of your post, then on a NEW LINE, provide an image prompt starting with: `IMAGE_PROMPT: `."""
 MENTION_CHECK_INTERVAL_SECONDS = 5 # Default 60s is good for production
 MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # Maximum depth of thread to gather for context
-NOTIFICATION_FETCH_LIMIT = 25
+NOTIFICATION_FETCH_LIMIT = 50
 MAX_GEMINI_RETRIES = 2
 GEMINI_RETRY_DELAY_SECONDS = 5
 
