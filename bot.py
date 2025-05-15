@@ -88,16 +88,39 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         
-        # Since we're having compatibility issues, use the most basic model initialization
-        # without system instructions or other settings
+        # Define safety settings
+        safety_settings = [
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+        ]
+
         model_kwargs = {
             "model_name": GEMINI_MODEL_NAME,
             "generation_config": {
                 "response_modalities": ["TEXT"]
-            }
+            },
+            "safety_settings": safety_settings
         }
         
-        logging.info(f"Initializing {GEMINI_MODEL_NAME} with basic configuration")
+        logging.info(f"Initializing {GEMINI_MODEL_NAME} with safety settings set to BLOCK_NONE for all categories.")
 
         model = genai.GenerativeModel(**model_kwargs)
         
@@ -328,51 +351,65 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             logging.info(f"[Mention Check] No duplicate bot reply found for mention {target_post.uri}. Proceeding.")
 
         elif notification.reason == 'reply':
-            logging.info(f"[Reply Check] Processing reply notification for {target_post.uri}")
-            post_record = target_post.record
-            # Check if the target post is a valid reply with parent info
-            if isinstance(post_record, at_models.AppBskyFeedPost.Record) and post_record.reply and post_record.reply.parent:
-                parent_ref = post_record.reply.parent
-                logging.info(f"[Reply Check] Post {target_post.uri} replies to parent URI: {parent_ref.uri}. Fetching parent...")
-                try:
-                    get_parent_params = GetPostsParams(uris=[parent_ref.uri])
-                    parent_post_response = bsky_client.app.bsky.feed.get_posts(params=get_parent_params)
-                    
-                    # Add detailed logging about the parent post response
-                    if parent_post_response:
-                        logging.info(f"[Reply Check] Parent post response received. Has posts: {bool(parent_post_response.posts)}, Posts count: {len(parent_post_response.posts) if parent_post_response.posts else 0}")
-                    
-                    if parent_post_response and parent_post_response.posts and len(parent_post_response.posts) == 1:
-                        immediate_parent_post = parent_post_response.posts[0]
-                        logging.info(f"[Reply Check] Fetched immediate parent post. Author: {immediate_parent_post.author.handle}, URI: {immediate_parent_post.uri}")
+            logging.info(f"[Reply Check] Processing reply notification for {target_post.uri}") # target_post is the user's new reply
+            post_record = target_post.record # This is the record of the user's new reply
 
-                        # **REVISED LOGIC**: Only proceed if the immediate parent IS the bot.
-                        if immediate_parent_post.author.handle == BLUESKY_HANDLE:
-                            logging.info(f"[Reply Check] ✓ Immediate parent is the bot. Continue processing.")
-                            logging.info(f"[Reply Check] Checking for duplicate replies under {target_post.uri}...")
-                            # Check for existing replies by the bot under the *triggering* post (target_post)
-                            if thread_view_of_mentioned_post.replies:
-                                 logging.info(f"[Reply Check] Target post has {len(thread_view_of_mentioned_post.replies)} replies to check for duplicates.")
-                                 for reply_to_users_reply in thread_view_of_mentioned_post.replies:
-                                    if reply_to_users_reply.post and reply_to_users_reply.post.author and \
-                                       reply_to_users_reply.post.author.handle == BLUESKY_HANDLE:
-                                        logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_users_reply.post.uri} under user's reply {target_post.uri}. Skipping.")
-                                        return
-                            # If no duplicate found, fall through to generate context and reply...
-                            logging.info(f"[Reply Check] ✓ No duplicate bot reply found under {target_post.uri}. Proceeding.")
-                        else:
-                            # Parent is another user, ignore this reply.
-                            logging.info(f"[IGNORE USER-TO-USER REPLY] ✗ Notification {notification.uri} is a reply to another user ({immediate_parent_post.author.handle}), not the bot. Ignoring.")
+            if not (isinstance(post_record, at_models.AppBskyFeedPost.Record) and \
+                    post_record.reply and post_record.reply.parent and post_record.reply.root):
+                logging.warning(f"[Reply Check] ✗ Notification {notification.uri} is a reply, but missing crucial parent or root reference. Skipping reply.")
+                return
+
+            # Get the immediate parent of the user's reply
+            immediate_parent_ref = post_record.reply.parent
+            immediate_parent_post = None
+            try:
+                parent_post_response = bsky_client.app.bsky.feed.get_posts(params=GetPostsParams(uris=[immediate_parent_ref.uri]))
+                if parent_post_response and parent_post_response.posts and len(parent_post_response.posts) == 1:
+                    immediate_parent_post = parent_post_response.posts[0]
+            except Exception as e:
+                logging.error(f"[Reply Check] ✗ Error fetching immediate parent post {immediate_parent_ref.uri}: {e}", exc_info=True)
+                return 
+
+            if not immediate_parent_post:
+                logging.warning(f"[Reply Check] ✗ Failed to fetch or parse immediate parent post {immediate_parent_ref.uri}. Skipping reply.")
+                return
+            logging.info(f"[Reply Check] Fetched immediate parent post. Author: {immediate_parent_post.author.handle}, URI: {immediate_parent_post.uri}")
+
+            # Get the root post of the thread
+            thread_root_ref = post_record.reply.root
+            thread_root_post = None
+            try:
+                root_post_response = bsky_client.app.bsky.feed.get_posts(params=GetPostsParams(uris=[thread_root_ref.uri]))
+                if root_post_response and root_post_response.posts and len(root_post_response.posts) == 1:
+                    thread_root_post = root_post_response.posts[0]
+            except Exception as e:
+                logging.error(f"[Reply Check] ✗ Error fetching thread root post {thread_root_ref.uri}: {e}", exc_info=True)
+                return
+
+            if not thread_root_post:
+                logging.warning(f"[Reply Check] ✗ Failed to fetch or parse thread root post {thread_root_ref.uri}. Skipping reply.")
+                return
+            logging.info(f"[Reply Check] Fetched thread root post. Author: {thread_root_post.author.handle}, URI: {thread_root_post.uri}")
+
+            # --- Decision Logic ---
+            user_replied_directly_to_bot = (immediate_parent_post.author.handle == BLUESKY_HANDLE)
+            parent_is_not_thread_root = (immediate_parent_post.uri != thread_root_post.uri)
+
+            if user_replied_directly_to_bot and parent_is_not_thread_root:
+                logging.info(f"[Reply Check] ✓ Conditions met: User replied directly to bot, and bot's post was not the thread root. Proceeding for {target_post.uri}.")
+                
+                # Check for existing replies by the bot under the *triggering* post (target_post)
+                if thread_view_of_mentioned_post.replies:
+                     logging.info(f"[Reply Check] Target post {target_post.uri} has {len(thread_view_of_mentioned_post.replies)} replies to check for duplicates.")
+                     for reply_to_users_reply in thread_view_of_mentioned_post.replies:
+                        if reply_to_users_reply.post and reply_to_users_reply.post.author and \
+                           reply_to_users_reply.post.author.handle == BLUESKY_HANDLE:
+                            logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_users_reply.post.uri} under user's reply {target_post.uri}. Skipping.")
                             return
-                    else:
-                        logging.warning(f"[Reply Check] ✗ Failed to fetch or parse immediate parent post {parent_ref.uri}. Cannot determine parent author. Skipping reply.")
-                        return # Skip if we can't verify parent
-                except Exception as e:
-                    logging.error(f"[Reply Check] ✗ Error fetching immediate parent post {parent_ref.uri}: {e}", exc_info=True)
-                    return # Skip if fetch fails
+                logging.info(f"[Reply Check] ✓ No duplicate bot reply found under {target_post.uri}. Proceeding to generate content.")
             else:
-                 logging.warning(f"[Reply Check] ✗ Notification {notification.uri} is a reply, but couldn't get parent ref from record. Skipping reply.")
-                 return # Skip if structure is unexpected
+                logging.info(f"[IGNORE REPLY] ✗ Conditions not met for {target_post.uri}. User replied to bot: {user_replied_directly_to_bot}. Bot's parent post was not root: {parent_is_not_thread_root}. Ignoring.")
+                return
         
         else: # Should not happen based on main loop filter, but good practice
             logging.warning(f"Skipping notification {notification.uri} with unexpected reason: {notification.reason}")
