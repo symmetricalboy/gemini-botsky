@@ -88,28 +88,13 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         
-        # Define safety settings
-        safety_settings = [
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
+        # Define safety settings as a list of dictionaries
+        safety_settings_as_dicts = [
+            {'category': 'HARM_CATEGORY_HARASSMENT', 'threshold': 'BLOCK_NONE'},
+            {'category': 'HARM_CATEGORY_HATE_SPEECH', 'threshold': 'BLOCK_NONE'},
+            {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'threshold': 'BLOCK_NONE'},
+            {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_NONE'},
+            {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'BLOCK_NONE'},
         ]
 
         model_kwargs = {
@@ -117,10 +102,10 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
             "generation_config": {
                 "response_modalities": ["TEXT"]
             },
-            "safety_settings": safety_settings
+            "safety_settings": safety_settings_as_dicts
         }
         
-        logging.info(f"Initializing {GEMINI_MODEL_NAME} with safety settings set to BLOCK_NONE for all categories.")
+        logging.info(f"Initializing {GEMINI_MODEL_NAME} with safety settings as dicts (all BLOCK_NONE).")
 
         model = genai.GenerativeModel(**model_kwargs)
         
