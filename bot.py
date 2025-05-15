@@ -49,11 +49,15 @@ Constraints:
 *   If a user asks for specific factual information (like a URL, definition, or specific details) that you can reasonably provide, include the *actual* information directly. 
 *   Don't avoid taboo topics or having a bit of an opinion. Users understand that you are imperfect & may not say the exact right thing.
 *   ONLY generate an image if the user EXPLICITLY asks for one or requests a visual. Do not generate images for any other reason. If and only if a user explicitly requests an image, compose the textual part of your post, then on a NEW LINE, provide an image prompt starting with: `IMAGE_PROMPT: `."""
-MENTION_CHECK_INTERVAL_SECONDS = 30
+MENTION_CHECK_INTERVAL_SECONDS = 5
 MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # Maximum depth of thread to gather for context
-NOTIFICATION_FETCH_LIMIT = 100
+NOTIFICATION_FETCH_LIMIT = 10
 MAX_GEMINI_RETRIES = 2
 GEMINI_RETRY_DELAY_SECONDS = 5
+
+# Constants for startup catch-up
+STARTUP_CATCHUP_PAGE_LIMIT = 5       # Number of pages to fetch during startup catch-up
+STARTUP_CATCHUP_FETCH_LIMIT = 100    # Number of notifications per page during catch-up
 
 # Global variables
 bsky_client: Client | None = None
@@ -1009,6 +1013,90 @@ def download_image_from_url(url: str, max_size_mb: float = 5.0, timeout: int = 1
         logging.error(f"Error downloading image from {url}: {e}")
         return None
 
+def perform_startup_catchup(bsky_client_ref: Client, gemini_model_ref: genai.GenerativeModel):
+    """Fetches and processes a larger batch of notifications on startup to catch missed posts."""
+    logging.info("Performing startup notification catch-up...")
+    global processed_uris_this_run # Interacts with the global set
+
+    latest_notification_indexed_at_overall = None
+    current_cursor = None
+    notifications_initiated_in_catchup = 0
+    max_catchup_notifications_to_log = 5 # To avoid overly verbose logging of every single notification
+
+    for page_num in range(STARTUP_CATCHUP_PAGE_LIMIT):
+        logging.info(f"Catch-up: Fetching page {page_num + 1}/{STARTUP_CATCHUP_PAGE_LIMIT} (limit {STARTUP_CATCHUP_FETCH_LIMIT} per page)...")
+        try:
+            params = ListNotificationsParams(limit=STARTUP_CATCHUP_FETCH_LIMIT, cursor=current_cursor)
+            response = bsky_client_ref.app.bsky.notification.list_notifications(params=params)
+
+            if not response or not response.notifications:
+                logging.info("Catch-up: No more notifications found on this page or an issue occurred.")
+                break
+            
+            logging.info(f"Catch-up: Fetched {len(response.notifications)} notifications on page {page_num + 1}.")
+
+            # Sort by indexedAt to process older unread notifications first,
+            # and to correctly find the latest for updateSeen
+            # Iterating in fetched order (reverse chronological) is fine since process_mention handles actual reply logic.
+            # The main reason for sorting in main_bot_loop was to ensure updateSeen used the true latest.
+            # Here, we update latest_notification_indexed_at_overall iteratively.
+
+            notifications_on_this_page = response.notifications # No need to sort for processing logic here
+
+            for i, notification in enumerate(notifications_on_this_page):
+                if notification.indexed_at:
+                    if latest_notification_indexed_at_overall is None or notification.indexed_at > latest_notification_indexed_at_overall:
+                        latest_notification_indexed_at_overall = notification.indexed_at
+                
+                if notification.uri in processed_uris_this_run:
+                    if i < max_catchup_notifications_to_log: # Log only for a few to keep logs cleaner
+                         logging.debug(f"Catch-up: Skipping {notification.uri} as it's already in processed_uris_this_run.")
+                    continue
+
+                if notification.author.handle == BLUESKY_HANDLE:
+                    if i < max_catchup_notifications_to_log:
+                        logging.info(f"Catch-up: Skipping notification {notification.uri} from bot itself.")
+                    continue
+                
+                if i < max_catchup_notifications_to_log or notification.reason in ['mention', 'reply']: # Log important ones or first few
+                    logging.info(f"Catch-up: Queuing for processing: type={notification.reason}, from={notification.author.handle}, uri={notification.uri}")
+                
+                if notification.reason in ['mention', 'reply']:
+                    # process_mention will add to processed_uris_this_run
+                    process_mention(notification, gemini_model_ref) 
+                    notifications_initiated_in_catchup +=1
+                # else:
+                    # if i < max_catchup_notifications_to_log:
+                        # logging.debug(f"Catch-up: Skipping {notification.uri}: Reason '{notification.reason}' not 'mention' or 'reply'.")
+
+            current_cursor = response.cursor
+            if not current_cursor:
+                logging.info("Catch-up: No further cursor from server, ending paged fetch.")
+                break
+        
+        except AtProtocolError as e:
+            logging.error(f"Catch-up: Bluesky API error during notification fetch page {page_num + 1}: {e}")
+            break 
+        except Exception as e:
+            logging.error(f"Catch-up: Unexpected error during notification fetch page {page_num + 1}: {e}", exc_info=True)
+            break 
+        
+        if page_num < STARTUP_CATCHUP_PAGE_LIMIT - 1 and current_cursor:
+            logging.debug(f"Catch-up: Pausing for 2 seconds before fetching next page.")
+            time.sleep(2) 
+
+    logging.info(f"Startup notification catch-up attempt finished. {notifications_initiated_in_catchup} notifications were queued for processing.")
+
+    if latest_notification_indexed_at_overall:
+        try:
+            logging.info(f"Catch-up: Attempting to call update_seen with latest server timestamp: {latest_notification_indexed_at_overall}")
+            bsky_client_ref.app.bsky.notification.update_seen({'seenAt': latest_notification_indexed_at_overall})
+            logging.info(f"Catch-up: Successfully called update_seen.")
+        except Exception as e:
+            logging.error(f"Catch-up: Error calling update_seen: {e}", exc_info=True)
+    else:
+        logging.info("Catch-up: No notifications processed, skipping update_seen.")
+
 def main_bot_loop():
     """Main loop for the bot to check for mentions and process them."""
     global bsky_client, gemini_model, processed_uris_this_run # Ensure access to initialized clients
@@ -1095,9 +1183,10 @@ def main():
     gemini_model = initialize_gemini_model()
     imagen_initialized = initialize_imagen_model() # Initialize Imagen client
 
-    # No initial update_seen call based on a loaded timestamp
-    if bsky_client and gemini_model and imagen_initialized: # Check all requirements are met
-        main_bot_loop()
+    if bsky_client and gemini_model and imagen_initialized: 
+        perform_startup_catchup(bsky_client, gemini_model) # Perform catch-up once
+        logging.info("Startup catch-up processing initiated. Starting main polling loop...")
+        main_bot_loop() # Then start the regular loop
     else:
         if not bsky_client:
             logging.error("Failed to initialize Bluesky client. Bot cannot start.")
