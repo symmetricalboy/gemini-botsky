@@ -89,23 +89,25 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
         genai.configure(api_key=GEMINI_API_KEY)
         
         # Define safety settings as a list of dictionaries
+        # Omitting HARM_CATEGORY_CIVIC_INTEGRITY as its default is BLOCK_NONE for gemini-2.0-flash
+        # and to avoid the KeyError with the current SDK version.
         safety_settings_as_dicts = [
             {'category': 'HARM_CATEGORY_HARASSMENT', 'threshold': 'BLOCK_NONE'},
             {'category': 'HARM_CATEGORY_HATE_SPEECH', 'threshold': 'BLOCK_NONE'},
             {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'threshold': 'BLOCK_NONE'},
             {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_NONE'},
-            {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'BLOCK_NONE'},
+            # Civici Integrity is omitted: HARM_CATEGORY_CIVIC_INTEGRITY uses default BLOCK_NONE for gemini-2.0-flash
         ]
 
         model_kwargs = {
             "model_name": GEMINI_MODEL_NAME,
-            "generation_config": {
+            "generation_config": { 
                 "response_modalities": ["TEXT"]
             },
-            "safety_settings": safety_settings_as_dicts
+            "safety_settings": safety_settings_as_dicts 
         }
         
-        logging.info(f"Initializing {GEMINI_MODEL_NAME} with safety settings as dicts (all BLOCK_NONE).")
+        logging.info(f"Initializing {GEMINI_MODEL_NAME} with 4 safety categories set to BLOCK_NONE (Civic Integrity uses default).")
 
         model = genai.GenerativeModel(**model_kwargs)
         
