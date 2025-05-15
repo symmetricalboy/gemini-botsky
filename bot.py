@@ -1043,13 +1043,9 @@ def main_bot_loop():
                         if latest_notification_indexed_at_in_batch is None or notification.indexed_at > latest_notification_indexed_at_in_batch:
                             latest_notification_indexed_at_in_batch = notification.indexed_at
                     
-                    if notification.is_read:
-                        logging.debug(f"Skipping already read notification: {notification.uri}")
-                        continue
-
-                    # Skip if already processed in this run (handles is_read lag)
+                    # Skip if already initiated processing in this run (handles potential duplicates in notification list or quick re-fetches)
                     if notification.uri in processed_uris_this_run:
-                        logging.debug(f"Skipping notification {notification.uri} already processed in this run.")
+                        logging.debug(f"Skipping notification {notification.uri} as it's already in processed_uris_this_run for this session.")
                         continue
 
                     # Skip if notification is from the bot itself to avoid loops or self-processing
