@@ -49,15 +49,12 @@ Constraints:
 *   If a user asks for specific factual information (like a URL, definition, or specific details) that you can reasonably provide, include the *actual* information directly. 
 *   Don't avoid taboo topics or having a bit of an opinion. Users understand that you are imperfect & may not say the exact right thing.
 *   ONLY generate an image if the user EXPLICITLY asks for one or requests a visual. Do not generate images for any other reason. If and only if a user explicitly requests an image, compose the textual part of your post, then on a NEW LINE, provide an image prompt starting with: `IMAGE_PROMPT: `."""
-MENTION_CHECK_INTERVAL_SECONDS = 15
+MENTION_CHECK_INTERVAL_SECONDS = 60 # Default 60s is good for production
 MAX_THREAD_DEPTH_FOR_CONTEXT = 15 # Maximum depth of thread to gather for context
-NOTIFICATION_FETCH_LIMIT = 10
+NOTIFICATION_FETCH_LIMIT = 25
 MAX_GEMINI_RETRIES = 2
 GEMINI_RETRY_DELAY_SECONDS = 5
-
-# Constants for startup catch-up
-STARTUP_CATCHUP_PAGE_LIMIT = 5       # Number of pages to fetch during startup catch-up
-STARTUP_CATCHUP_FETCH_LIMIT = 100    # Number of notifications per page during catch-up
+CATCH_UP_NOTIFICATION_LIMIT = 100 # Number of notifications to check on startup for catch-up
 
 # Global variables
 bsky_client: Client | None = None
@@ -92,26 +89,16 @@ def initialize_gemini_model() -> genai.GenerativeModel | None:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         
-        # Define safety settings as a list of dictionaries
-        # Omitting HARM_CATEGORY_CIVIC_INTEGRITY as its default is BLOCK_NONE for gemini-2.0-flash
-        # and to avoid the KeyError with the current SDK version.
-        safety_settings_as_dicts = [
-            {'category': 'HARM_CATEGORY_HARASSMENT', 'threshold': 'BLOCK_NONE'},
-            {'category': 'HARM_CATEGORY_HATE_SPEECH', 'threshold': 'BLOCK_NONE'},
-            {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'threshold': 'BLOCK_NONE'},
-            {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_NONE'},
-            # Civici Integrity is omitted: HARM_CATEGORY_CIVIC_INTEGRITY uses default BLOCK_NONE for gemini-2.0-flash
-        ]
-
+        # Since we're having compatibility issues, use the most basic model initialization
+        # without system instructions or other settings
         model_kwargs = {
             "model_name": GEMINI_MODEL_NAME,
-            "generation_config": { 
+            "generation_config": {
                 "response_modalities": ["TEXT"]
-            },
-            "safety_settings": safety_settings_as_dicts 
+            }
         }
         
-        logging.info(f"Initializing {GEMINI_MODEL_NAME} with 4 safety categories set to BLOCK_NONE (Civic Integrity uses default).")
+        logging.info(f"Initializing {GEMINI_MODEL_NAME} with basic configuration")
 
         model = genai.GenerativeModel(**model_kwargs)
         
@@ -342,65 +329,51 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
             logging.info(f"[Mention Check] No duplicate bot reply found for mention {target_post.uri}. Proceeding.")
 
         elif notification.reason == 'reply':
-            logging.info(f"[Reply Check] Processing reply notification for {target_post.uri}") # target_post is the user's new reply
-            post_record = target_post.record # This is the record of the user's new reply
+            logging.info(f"[Reply Check] Processing reply notification for {target_post.uri}")
+            post_record = target_post.record
+            # Check if the target post is a valid reply with parent info
+            if isinstance(post_record, at_models.AppBskyFeedPost.Record) and post_record.reply and post_record.reply.parent:
+                parent_ref = post_record.reply.parent
+                logging.info(f"[Reply Check] Post {target_post.uri} replies to parent URI: {parent_ref.uri}. Fetching parent...")
+                try:
+                    get_parent_params = GetPostsParams(uris=[parent_ref.uri])
+                    parent_post_response = bsky_client.app.bsky.feed.get_posts(params=get_parent_params)
+                    
+                    # Add detailed logging about the parent post response
+                    if parent_post_response:
+                        logging.info(f"[Reply Check] Parent post response received. Has posts: {bool(parent_post_response.posts)}, Posts count: {len(parent_post_response.posts) if parent_post_response.posts else 0}")
+                    
+                    if parent_post_response and parent_post_response.posts and len(parent_post_response.posts) == 1:
+                        immediate_parent_post = parent_post_response.posts[0]
+                        logging.info(f"[Reply Check] Fetched immediate parent post. Author: {immediate_parent_post.author.handle}, URI: {immediate_parent_post.uri}")
 
-            if not (isinstance(post_record, at_models.AppBskyFeedPost.Record) and \
-                    post_record.reply and post_record.reply.parent and post_record.reply.root):
-                logging.warning(f"[Reply Check] ✗ Notification {notification.uri} is a reply, but missing crucial parent or root reference. Skipping reply.")
-                return
-
-            # Get the immediate parent of the user's reply
-            immediate_parent_ref = post_record.reply.parent
-            immediate_parent_post = None
-            try:
-                parent_post_response = bsky_client.app.bsky.feed.get_posts(params=GetPostsParams(uris=[immediate_parent_ref.uri]))
-                if parent_post_response and parent_post_response.posts and len(parent_post_response.posts) == 1:
-                    immediate_parent_post = parent_post_response.posts[0]
-            except Exception as e:
-                logging.error(f"[Reply Check] ✗ Error fetching immediate parent post {immediate_parent_ref.uri}: {e}", exc_info=True)
-                return 
-
-            if not immediate_parent_post:
-                logging.warning(f"[Reply Check] ✗ Failed to fetch or parse immediate parent post {immediate_parent_ref.uri}. Skipping reply.")
-                return
-            logging.info(f"[Reply Check] Fetched immediate parent post. Author: {immediate_parent_post.author.handle}, URI: {immediate_parent_post.uri}")
-
-            # Get the root post of the thread
-            thread_root_ref = post_record.reply.root
-            thread_root_post = None
-            try:
-                root_post_response = bsky_client.app.bsky.feed.get_posts(params=GetPostsParams(uris=[thread_root_ref.uri]))
-                if root_post_response and root_post_response.posts and len(root_post_response.posts) == 1:
-                    thread_root_post = root_post_response.posts[0]
-            except Exception as e:
-                logging.error(f"[Reply Check] ✗ Error fetching thread root post {thread_root_ref.uri}: {e}", exc_info=True)
-                return
-
-            if not thread_root_post:
-                logging.warning(f"[Reply Check] ✗ Failed to fetch or parse thread root post {thread_root_ref.uri}. Skipping reply.")
-                return
-            logging.info(f"[Reply Check] Fetched thread root post. Author: {thread_root_post.author.handle}, URI: {thread_root_post.uri}")
-
-            # --- Decision Logic ---
-            user_replied_directly_to_bot = (immediate_parent_post.author.handle == BLUESKY_HANDLE)
-            parent_is_not_thread_root = (immediate_parent_post.uri != thread_root_post.uri)
-
-            if user_replied_directly_to_bot and parent_is_not_thread_root:
-                logging.info(f"[Reply Check] ✓ Conditions met: User replied directly to bot, and bot's post was not the thread root. Proceeding for {target_post.uri}.")
-                
-                # Check for existing replies by the bot under the *triggering* post (target_post)
-                if thread_view_of_mentioned_post.replies:
-                     logging.info(f"[Reply Check] Target post {target_post.uri} has {len(thread_view_of_mentioned_post.replies)} replies to check for duplicates.")
-                     for reply_to_users_reply in thread_view_of_mentioned_post.replies:
-                        if reply_to_users_reply.post and reply_to_users_reply.post.author and \
-                           reply_to_users_reply.post.author.handle == BLUESKY_HANDLE:
-                            logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_users_reply.post.uri} under user's reply {target_post.uri}. Skipping.")
+                        # **REVISED LOGIC**: Only proceed if the immediate parent IS the bot.
+                        if immediate_parent_post.author.handle == BLUESKY_HANDLE:
+                            logging.info(f"[Reply Check] ✓ Immediate parent is the bot. Continue processing.")
+                            logging.info(f"[Reply Check] Checking for duplicate replies under {target_post.uri}...")
+                            # Check for existing replies by the bot under the *triggering* post (target_post)
+                            if thread_view_of_mentioned_post.replies:
+                                 logging.info(f"[Reply Check] Target post has {len(thread_view_of_mentioned_post.replies)} replies to check for duplicates.")
+                                 for reply_to_users_reply in thread_view_of_mentioned_post.replies:
+                                    if reply_to_users_reply.post and reply_to_users_reply.post.author and \
+                                       reply_to_users_reply.post.author.handle == BLUESKY_HANDLE:
+                                        logging.info(f"[DUPE CHECK REPLY] Found pre-existing bot reply {reply_to_users_reply.post.uri} under user's reply {target_post.uri}. Skipping.")
+                                        return
+                            # If no duplicate found, fall through to generate context and reply...
+                            logging.info(f"[Reply Check] ✓ No duplicate bot reply found under {target_post.uri}. Proceeding.")
+                        else:
+                            # Parent is another user, ignore this reply.
+                            logging.info(f"[IGNORE USER-TO-USER REPLY] ✗ Notification {notification.uri} is a reply to another user ({immediate_parent_post.author.handle}), not the bot. Ignoring.")
                             return
-                logging.info(f"[Reply Check] ✓ No duplicate bot reply found under {target_post.uri}. Proceeding to generate content.")
+                    else:
+                        logging.warning(f"[Reply Check] ✗ Failed to fetch or parse immediate parent post {parent_ref.uri}. Cannot determine parent author. Skipping reply.")
+                        return # Skip if we can't verify parent
+                except Exception as e:
+                    logging.error(f"[Reply Check] ✗ Error fetching immediate parent post {parent_ref.uri}: {e}", exc_info=True)
+                    return # Skip if fetch fails
             else:
-                logging.info(f"[IGNORE REPLY] ✗ Conditions not met for {target_post.uri}. User replied to bot: {user_replied_directly_to_bot}. Bot's parent post was not root: {parent_is_not_thread_root}. Ignoring.")
-                return
+                 logging.warning(f"[Reply Check] ✗ Notification {notification.uri} is a reply, but couldn't get parent ref from record. Skipping reply.")
+                 return # Skip if structure is unexpected
         
         else: # Should not happen based on main loop filter, but good practice
             logging.warning(f"Skipping notification {notification.uri} with unexpected reason: {notification.reason}")
@@ -1013,89 +986,55 @@ def download_image_from_url(url: str, max_size_mb: float = 5.0, timeout: int = 1
         logging.error(f"Error downloading image from {url}: {e}")
         return None
 
-def perform_startup_catchup(bsky_client_ref: Client, gemini_model_ref: genai.GenerativeModel):
-    """Fetches and processes a larger batch of notifications on startup to catch missed posts."""
-    logging.info("Performing startup notification catch-up...")
-    global processed_uris_this_run # Interacts with the global set
+def catch_up_missed_notifications(bsky_client_ref: Client, gemini_model_ref: genai.GenerativeModel):
+    """Fetches and processes past notifications to catch up on missed interactions."""
+    global processed_uris_this_run # Ensure access to the global set
+    if not (bsky_client_ref and gemini_model_ref):
+        logging.error("Bluesky client or Gemini model not available for catch-up.")
+        return
 
-    latest_notification_indexed_at_overall = None
-    current_cursor = None
-    notifications_initiated_in_catchup = 0
-    max_catchup_notifications_to_log = 5 # To avoid overly verbose logging of every single notification
+    logging.info(f"Starting catch-up: Fetching last {CATCH_UP_NOTIFICATION_LIMIT} notifications...")
+    try:
+        params = ListNotificationsParams(limit=CATCH_UP_NOTIFICATION_LIMIT)
+        response = bsky_client_ref.app.bsky.notification.list_notifications(params=params)
 
-    for page_num in range(STARTUP_CATCHUP_PAGE_LIMIT):
-        logging.info(f"Catch-up: Fetching page {page_num + 1}/{STARTUP_CATCHUP_PAGE_LIMIT} (limit {STARTUP_CATCHUP_FETCH_LIMIT} per page)...")
-        try:
-            params = ListNotificationsParams(limit=STARTUP_CATCHUP_FETCH_LIMIT, cursor=current_cursor)
-            response = bsky_client_ref.app.bsky.notification.list_notifications(params=params)
+        if response and response.notifications:
+            logging.info(f"Catch-up: Fetched {len(response.notifications)} notifications.")
+            # Sort by indexedAt to process older notifications first, though order for catch-up is less critical
+            # as we are checking for already replied posts.
+            sorted_notifications = sorted(response.notifications, key=lambda n: n.indexed_at)
 
-            if not response or not response.notifications:
-                logging.info("Catch-up: No more notifications found on this page or an issue occurred.")
-                break
-            
-            logging.info(f"Catch-up: Fetched {len(response.notifications)} notifications on page {page_num + 1}.")
-
-            # Sort by indexedAt to process older unread notifications first,
-            # and to correctly find the latest for updateSeen
-            # Iterating in fetched order (reverse chronological) is fine since process_mention handles actual reply logic.
-            # The main reason for sorting in main_bot_loop was to ensure updateSeen used the true latest.
-            # Here, we update latest_notification_indexed_at_overall iteratively.
-
-            notifications_on_this_page = response.notifications # No need to sort for processing logic here
-
-            for i, notification in enumerate(notifications_on_this_page):
-                if notification.indexed_at:
-                    if latest_notification_indexed_at_overall is None or notification.indexed_at > latest_notification_indexed_at_overall:
-                        latest_notification_indexed_at_overall = notification.indexed_at
-                
-                if notification.uri in processed_uris_this_run:
-                    if i < max_catchup_notifications_to_log: # Log only for a few to keep logs cleaner
-                         logging.debug(f"Catch-up: Skipping {notification.uri} as it's already in processed_uris_this_run.")
-                    continue
-
+            processed_in_catchup = 0
+            for notification in sorted_notifications:
+                # Skip if notification is from the bot itself
                 if notification.author.handle == BLUESKY_HANDLE:
-                    if i < max_catchup_notifications_to_log:
-                        logging.info(f"Catch-up: Skipping notification {notification.uri} from bot itself.")
+                    logging.debug(f"Catch-up: Skipping notification {notification.uri} from bot itself.")
                     continue
                 
-                if i < max_catchup_notifications_to_log or notification.reason in ['mention', 'reply']: # Log important ones or first few
-                    logging.info(f"Catch-up: Queuing for processing: type={notification.reason}, from={notification.author.handle}, uri={notification.uri}")
-                
+                # Skip if already processed in this current run (e.g. if catch-up is somehow run multiple times quickly)
+                # This is less critical here than in main_loop but good for consistency.
+                if notification.uri in processed_uris_this_run:
+                    logging.debug(f"Catch-up: Skipping notification {notification.uri} already processed in this run/session.")
+                    continue
+
+                # We are re-analyzing, so we don't strictly skip based on `is_read` here,
+                # as the bot might have gone down before processing or marking as read.
+                # The `process_mention` function has internal duplicate reply prevention.
+
+                logging.info(f"Catch-up: Analyzing notification: type={notification.reason}, from={notification.author.handle}, uri={notification.uri}")
                 if notification.reason in ['mention', 'reply']:
-                    # process_mention will add to processed_uris_this_run
-                    process_mention(notification, gemini_model_ref) 
-                    notifications_initiated_in_catchup +=1
-                # else:
-                    # if i < max_catchup_notifications_to_log:
-                        # logging.debug(f"Catch-up: Skipping {notification.uri}: Reason '{notification.reason}' not 'mention' or 'reply'.")
-
-            current_cursor = response.cursor
-            if not current_cursor:
-                logging.info("Catch-up: No further cursor from server, ending paged fetch.")
-                break
-        
-        except AtProtocolError as e:
-            logging.error(f"Catch-up: Bluesky API error during notification fetch page {page_num + 1}: {e}")
-            break 
-        except Exception as e:
-            logging.error(f"Catch-up: Unexpected error during notification fetch page {page_num + 1}: {e}", exc_info=True)
-            break 
-        
-        if page_num < STARTUP_CATCHUP_PAGE_LIMIT - 1 and current_cursor:
-            logging.debug(f"Catch-up: Pausing for 2 seconds before fetching next page.")
-            time.sleep(2) 
-
-    logging.info(f"Startup notification catch-up attempt finished. {notifications_initiated_in_catchup} notifications were queued for processing.")
-
-    if latest_notification_indexed_at_overall:
-        try:
-            logging.info(f"Catch-up: Attempting to call update_seen with latest server timestamp: {latest_notification_indexed_at_overall}")
-            bsky_client_ref.app.bsky.notification.update_seen({'seenAt': latest_notification_indexed_at_overall})
-            logging.info(f"Catch-up: Successfully called update_seen.")
-        except Exception as e:
-            logging.error(f"Catch-up: Error calling update_seen: {e}", exc_info=True)
-    else:
-        logging.info("Catch-up: No notifications processed, skipping update_seen.")
+                    process_mention(notification, gemini_model_ref)
+                    processed_in_catchup += 1
+                else:
+                    logging.debug(f"Catch-up: Skipping notification {notification.uri} with reason '{notification.reason}'.")
+            logging.info(f"Catch-up: Finished processing {processed_in_catchup} relevant notifications from the fetched batch.")
+        else:
+            logging.info("Catch-up: No notifications found or error in fetching for catch-up.")
+    except AtProtocolError as e:
+        logging.error(f"Catch-up: Bluesky API error during catch-up: {e}")
+    except Exception as e:
+        logging.error(f"Catch-up: Unexpected error during catch-up: {e}", exc_info=True)
+    logging.info("Catch-up process complete.")
 
 def main_bot_loop():
     """Main loop for the bot to check for mentions and process them."""
@@ -1131,9 +1070,9 @@ def main_bot_loop():
                         if latest_notification_indexed_at_in_batch is None or notification.indexed_at > latest_notification_indexed_at_in_batch:
                             latest_notification_indexed_at_in_batch = notification.indexed_at
                     
-                    # Skip if already initiated processing in this run (handles potential duplicates in notification list or quick re-fetches)
+                    # Skip if already processed in this run (handles potential lag in is_read or re-fetching within same loop cycle)
                     if notification.uri in processed_uris_this_run:
-                        logging.debug(f"Skipping notification {notification.uri} as it's already in processed_uris_this_run for this session.")
+                        logging.debug(f"Skipping notification {notification.uri} already processed in this run.")
                         continue
 
                     # Skip if notification is from the bot itself to avoid loops or self-processing
@@ -1183,10 +1122,11 @@ def main():
     gemini_model = initialize_gemini_model()
     imagen_initialized = initialize_imagen_model() # Initialize Imagen client
 
-    if bsky_client and gemini_model and imagen_initialized: 
-        perform_startup_catchup(bsky_client, gemini_model) # Perform catch-up once
-        logging.info("Startup catch-up processing initiated. Starting main polling loop...")
-        main_bot_loop() # Then start the regular loop
+    # No initial update_seen call based on a loaded timestamp
+    if bsky_client and gemini_model and imagen_initialized: # Check all requirements are met
+        # Perform catch-up for missed notifications before starting the main loop
+        catch_up_missed_notifications(bsky_client, gemini_model)
+        main_bot_loop()
     else:
         if not bsky_client:
             logging.error("Failed to initialize Bluesky client. Bot cannot start.")
