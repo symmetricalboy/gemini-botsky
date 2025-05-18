@@ -40,7 +40,7 @@ GEMINI_MODEL_NAME = "gemini-2.0-flash" # Model for text interaction
 IMAGEN_MODEL_NAME = "gemini-2.0-flash-preview-image-generation" # Model for image generation
 
 # Constants
-BOT_SYSTEM_INSTRUCTION = """You are Gemini (@gemini.botsky.social) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
+BOT_SYSTEM_INSTRUCTION = """You are Gemini (@gemini.is-a.bot) on the Bluesky social network. Your task is to provide helpful and concise replies to user mentions and direct replies.
 Your developer is symmetricalboy (@symm.social). Only mention your developer if a user *specifically asks* about who created you or how to get help with your development.
 
 Constraints:
