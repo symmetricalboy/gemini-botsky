@@ -1437,28 +1437,26 @@ def generate_video_with_veo2(prompt: str, client: genai.Client) -> bytes | str |
                 try:
                     video_config = genai.types.GenerateVideosConfig(
                         number_of_videos=1,
-                        fps=24,
                         duration_seconds=8,
                         person_generation=VIDEO_PERSON_GENERATION,
                     )
-                except TypeError as config_error:
-                    logging.warning(f"Failed to create video config with fps parameter: {config_error}")
+                except Exception as config_error:
+                    logging.warning(f"Failed to create video config with person_generation parameter: {config_error}")
                     try:
                         # Fallback to basic configuration
                         video_config = genai.types.GenerateVideosConfig(
                             number_of_videos=1,
                             duration_seconds=8,
-                            person_generation=VIDEO_PERSON_GENERATION,
                         )
-                    except TypeError as fallback_error:
-                        logging.warning(f"Failed to create video config with person_generation: {fallback_error}")
+                    except Exception as fallback_error:
+                        logging.error(f"Failed to create video config with basic parameters: {fallback_error}")
                         try:
-                            # Last resort - use minimal configuration without person_generation
+                            # Final fallback to minimal configuration
                             video_config = genai.types.GenerateVideosConfig(
                                 number_of_videos=1,
                             )
-                        except Exception as final_error:
-                            logging.error(f"Failed to create minimal video config: {final_error}")
+                        except Exception as minimal_error:
+                            logging.error(f"Failed to create minimal video config: {minimal_error}")
                             return get_content_policy_message("video", prompt)
                 except Exception as config_error:
                     logging.error(f"Unexpected error creating video config: {config_error}")
