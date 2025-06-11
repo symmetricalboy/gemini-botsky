@@ -1413,35 +1413,62 @@ def generate_video_with_veo2(prompt: str, client: genai.Client) -> bytes | str |
         try:
             logging.info(f"🎬 Video generation attempt {attempt + 1}/{MAX_VIDEO_GENERATION_RETRIES}")
             
-            # Try to create video configuration with different parameter sets for compatibility
-            try:
-                video_config = genai.types.GenerateVideosConfig(
-                    number_of_videos=1,
-                    fps=24,
-                    duration_seconds=8,
-                    person_generation=VIDEO_PERSON_GENERATION,
-                )
-            except Exception as config_error:
-                logging.warning(f"Failed to create video config with fps parameter: {config_error}")
+            # Check if GenerateVideosConfig is available in this SDK version
+            if not hasattr(genai.types, 'GenerateVideosConfig'):
+                error_msg = f"Video generation not supported in this SDK version. GenerateVideosConfig not available."
+                logging.warning(error_msg)
+                # Try using dictionary-based configuration as fallback
                 try:
-                    # Fallback to basic configuration
+                    logging.info("Attempting video generation with dictionary-based config...")
+                    operation = client.models.generate_videos(
+                        model=VEO_MODEL_NAME,
+                        prompt=prompt,
+                        config={
+                            "number_of_videos": 1,
+                            "duration_seconds": 8,
+                            "person_generation": VIDEO_PERSON_GENERATION,
+                        }
+                    )
+                except Exception as dict_error:
+                    logging.error(f"Dictionary-based video generation also failed: {dict_error}")
+                    return get_content_policy_message("video", prompt)
+            else:
+                # Try to create video configuration with different parameter sets for compatibility
+                try:
                     video_config = genai.types.GenerateVideosConfig(
                         number_of_videos=1,
+                        fps=24,
                         duration_seconds=8,
                         person_generation=VIDEO_PERSON_GENERATION,
                     )
-                except Exception as fallback_error:
-                    logging.error(f"Failed to create video config with basic parameters: {fallback_error}")
-                    # Last resort - use minimal configuration without person_generation
-                    video_config = genai.types.GenerateVideosConfig(
-                        number_of_videos=1,
-                    )
+                except TypeError as config_error:
+                    logging.warning(f"Failed to create video config with fps parameter: {config_error}")
+                    try:
+                        # Fallback to basic configuration
+                        video_config = genai.types.GenerateVideosConfig(
+                            number_of_videos=1,
+                            duration_seconds=8,
+                            person_generation=VIDEO_PERSON_GENERATION,
+                        )
+                    except TypeError as fallback_error:
+                        logging.warning(f"Failed to create video config with person_generation: {fallback_error}")
+                        try:
+                            # Last resort - use minimal configuration without person_generation
+                            video_config = genai.types.GenerateVideosConfig(
+                                number_of_videos=1,
+                            )
+                        except Exception as final_error:
+                            logging.error(f"Failed to create minimal video config: {final_error}")
+                            return get_content_policy_message("video", prompt)
+                except Exception as config_error:
+                    logging.error(f"Unexpected error creating video config: {config_error}")
+                    return get_content_policy_message("video", prompt)
 
-            operation = client.models.generate_videos(
-                model=VEO_MODEL_NAME,
-                prompt=prompt,
-                config=video_config,
-            )
+                operation = client.models.generate_videos(
+                    model=VEO_MODEL_NAME,
+                    prompt=prompt,
+                    config=video_config,
+                )
 
             logging.info(f"Video generation started (attempt {attempt + 1}). Polling for completion...")
             
