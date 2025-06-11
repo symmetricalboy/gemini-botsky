@@ -7,7 +7,7 @@ python-dotenv>=1.0.0,<2.0.0
 Pillow>=11.2.1,<12.0.0
 requests>=2.32.0,<3.0.0
 psutil>=5.9.0,<6.0.0
-websockets>=12.0,<13.0
+websockets>=12.0,<14.0
 
 # Optional but recommended for production
 # Add these if you want enhanced logging, monitoring, or persistence
