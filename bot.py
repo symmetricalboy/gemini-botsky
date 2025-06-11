@@ -38,6 +38,8 @@ import urllib.parse
 import asyncio
 import json
 import threading
+import queue
+import concurrent.futures
 from typing import Optional
 from dotenv import load_dotenv
 from atproto import Client, models
@@ -169,6 +171,17 @@ bot_did: str | None = None # Bot's DID for filtering
 # Thread safety lock
 _processed_uris_lock = threading.Lock()
 
+# Jetstream event processing queue and thread pool
+jetstream_event_queue: queue.Queue = queue.Queue(maxsize=1000)  # Buffer up to 1000 events
+jetstream_executor: concurrent.futures.ThreadPoolExecutor | None = None
+jetstream_stats = {
+    'events_received': 0,
+    'events_processed': 0,
+    'events_dropped': 0,
+    'queue_size': 0,
+    'processing_errors': 0
+}
+
 # Rate limiting
 @dataclass
 class RateLimiter:
@@ -196,6 +209,115 @@ class RateLimiter:
         self.last_bluesky_call = time.time()
 
 rate_limiter = RateLimiter()
+
+def initialize_jetstream_processing():
+    """Initialize the thread pool for processing Jetstream events."""
+    global jetstream_executor
+    if jetstream_executor is None:
+        # Use a moderate number of threads to process events concurrently
+        max_workers = min(32, (os.cpu_count() or 1) + 4)
+        jetstream_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="jetstream-worker"
+        )
+        logging.info(f"🧵 Initialized Jetstream thread pool with {max_workers} workers")
+
+def shutdown_jetstream_processing():
+    """Shutdown the thread pool gracefully."""
+    global jetstream_executor
+    if jetstream_executor:
+        logging.info("🛑 Shutting down Jetstream thread pool...")
+        jetstream_executor.shutdown(wait=True)
+        jetstream_executor = None
+        logging.info("✅ Jetstream thread pool shutdown complete")
+
+def jetstream_event_worker():
+    """Worker function that processes events from the queue."""
+    global genai_client, jetstream_stats
+    
+    while True:
+        try:
+            # Get event from queue with timeout
+            event = jetstream_event_queue.get(timeout=1.0)
+            if event is None:  # Shutdown signal
+                break
+                
+            jetstream_stats['queue_size'] = jetstream_event_queue.qsize()
+            
+            # Process the event
+            try:
+                process_jetstream_event(event, genai_client)
+                jetstream_stats['events_processed'] += 1
+            except Exception as e:
+                jetstream_stats['processing_errors'] += 1
+                logging.error(f"Error processing Jetstream event: {e}", exc_info=True)
+            finally:
+                jetstream_event_queue.task_done()
+                
+        except queue.Empty:
+            # Timeout - continue loop to check for shutdown
+            continue
+        except Exception as e:
+            logging.error(f"Error in Jetstream worker: {e}", exc_info=True)
+            time.sleep(1)  # Brief pause before retrying
+
+def enqueue_jetstream_event(event: dict) -> bool:
+    """
+    Add a Jetstream event to the processing queue.
+    Returns True if event was queued, False if queue is full.
+    """
+    global jetstream_stats
+    
+    try:
+        jetstream_event_queue.put_nowait(event)
+        jetstream_stats['events_received'] += 1
+        jetstream_stats['queue_size'] = jetstream_event_queue.qsize()
+        return True
+    except queue.Full:
+        jetstream_stats['events_dropped'] += 1
+        logging.warning(f"⚠️ Jetstream event queue full! Dropped event. Total dropped: {jetstream_stats['events_dropped']}")
+        return False
+
+def log_jetstream_stats():
+    """Log current Jetstream processing statistics."""
+    global jetstream_stats
+    stats = jetstream_stats.copy()
+    stats['queue_size'] = jetstream_event_queue.qsize()
+    
+    logging.info(
+        f"📊 Jetstream Stats: "
+        f"Received: {stats['events_received']}, "
+        f"Processed: {stats['events_processed']}, "
+        f"Dropped: {stats['events_dropped']}, "
+        f"Queue: {stats['queue_size']}, "
+        f"Errors: {stats['processing_errors']}"
+    )
+    
+    # Health checks
+    queue_usage_percent = (stats['queue_size'] / 1000.0) * 100
+    
+    # Alert if queue is getting full
+    if queue_usage_percent > 80:
+        warning_msg = f"⚠️ Jetstream queue {queue_usage_percent:.1f}% full ({stats['queue_size']}/1000). Processing may be lagging behind."
+        logging.warning(warning_msg)
+        if queue_usage_percent > 95:
+            send_developer_dm(warning_msg, "QUEUE WARNING", allow_public_fallback=False)
+    
+    # Alert if error rate is high
+    if stats['events_received'] > 100:  # Only check after reasonable number of events
+        error_rate = (stats['processing_errors'] / stats['events_received']) * 100
+        if error_rate > 10:
+            error_msg = f"⚠️ High Jetstream processing error rate: {error_rate:.1f}% ({stats['processing_errors']}/{stats['events_received']})"
+            logging.warning(error_msg)
+            send_developer_dm(error_msg, "ERROR RATE WARNING", allow_public_fallback=False)
+    
+    # Alert if too many events are being dropped
+    if stats['events_dropped'] > 0 and stats['events_received'] > 0:
+        drop_rate = (stats['events_dropped'] / stats['events_received']) * 100
+        if drop_rate > 5:
+            drop_msg = f"⚠️ High Jetstream event drop rate: {drop_rate:.1f}% ({stats['events_dropped']}/{stats['events_received']})"
+            logging.warning(drop_msg)
+            send_developer_dm(drop_msg, "DROP RATE WARNING", allow_public_fallback=False)
 
 def is_content_policy_failure(error_msg: str, response_obj=None, prompt: str = None) -> bool:
     """Detect if a failure is due to content policy/safety filtering rather than technical issues."""
@@ -2070,7 +2192,7 @@ def process_jetstream_event(event: dict, genai_client_ref: genai.Client):
         logging.error(f"Error processing Jetstream event: {e}", exc_info=True)
 
 async def jetstream_listener():
-    """Main Jetstream listener loop."""
+    """Main Jetstream listener loop that feeds events to the processing queue."""
     global genai_client
     if not genai_client:
         logging.error("GenAI client not initialized. Cannot start Jetstream listener.")
@@ -2078,17 +2200,66 @@ async def jetstream_listener():
     
     logging.info("🚀 Starting Jetstream listener...")
     
-    async for event in connect_to_jetstream():
-        try:
-            # Run the processing in a thread to avoid blocking the async loop
-            threading.Thread(
-                target=process_jetstream_event,
-                args=(event, genai_client),
-                daemon=True
-            ).start()
-        except Exception as e:
-            logging.error(f"Error starting thread for event processing: {e}")
-            # Don't send DM for every thread error, just log it
+    # Start worker threads for processing events
+    initialize_jetstream_processing()
+    
+    # Start worker threads
+    worker_threads = []
+    num_workers = min(8, (os.cpu_count() or 1) + 2)  # Separate workers for event processing
+    for i in range(num_workers):
+        worker = threading.Thread(
+            target=jetstream_event_worker,
+            name=f"jetstream-worker-{i}",
+            daemon=True
+        )
+        worker.start()
+        worker_threads.append(worker)
+    
+    logging.info(f"🧵 Started {num_workers} Jetstream worker threads")
+    
+    # Start stats logging thread
+    stats_thread = threading.Thread(
+        target=lambda: [time.sleep(60) or log_jetstream_stats() for _ in iter(int, 1)],
+        name="jetstream-stats",
+        daemon=True
+    )
+    stats_thread.start()
+    
+    event_count = 0
+    try:
+        async for event in connect_to_jetstream():
+            try:
+                # Simply enqueue the event - this is very fast and non-blocking
+                if enqueue_jetstream_event(event):
+                    event_count += 1
+                    if event_count % 100 == 0:  # Log every 100 events
+                        logging.debug(f"📥 Received {event_count} Jetstream events")
+                else:
+                    # Event was dropped due to full queue
+                    logging.warning("⚠️ Event dropped - processing queue full")
+                    
+            except Exception as e:
+                logging.error(f"Error enqueueing Jetstream event: {e}")
+                
+    except Exception as e:
+        logging.error(f"Fatal error in Jetstream listener: {e}", exc_info=True)
+    finally:
+        # Cleanup
+        logging.info("🛑 Shutting down Jetstream processing...")
+        
+        # Signal workers to stop by putting None events
+        for _ in range(num_workers):
+            try:
+                jetstream_event_queue.put_nowait(None)
+            except queue.Full:
+                pass
+        
+        # Wait for workers to finish
+        for worker in worker_threads:
+            worker.join(timeout=5.0)
+        
+        shutdown_jetstream_processing()
+        log_jetstream_stats()  # Final stats
 
 def catch_up_missed_notifications(bsky_client_ref: Client, genai_client_ref: genai.Client):
     """Fetches and processes past notifications to catch up on missed interactions."""
@@ -2168,7 +2339,8 @@ async def main():
     if bsky_client and genai_client: # Check all requirements are met
         # Send startup notification to developer
         try:
-            startup_msg = f"🤖 Bot @{BLUESKY_HANDLE} started successfully!\n\nFeatures enabled:\n- Jetstream real-time monitoring\n- Gemini AI responses\n- Image generation (Imagen 3)\n- Video generation (Veo 2)\n- Thread management\n- Rate limiting\n\nMemory: {psutil.Process().memory_info().rss / 1024 / 1024:.1f} MB"
+            num_workers = min(8, (os.cpu_count() or 1) + 2)
+            startup_msg = f"🤖 Bot @{BLUESKY_HANDLE} started successfully!\n\nFeatures enabled:\n- Jetstream real-time monitoring (queue-based)\n- {num_workers} worker threads for event processing\n- Event queue capacity: 1000 events\n- Gemini AI responses\n- Image generation (Imagen 3)\n- Video generation (Veo 2)\n- Thread management\n- Rate limiting\n\nMemory: {psutil.Process().memory_info().rss / 1024 / 1024:.1f} MB"
             send_startup_notification(startup_msg)
         except Exception as startup_error:
             logging.warning(f"Failed to send startup notification: {startup_error}")
