@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      - redis
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - bot-network
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - bot-network
+    # Uncomment below for Redis with persistence
+    # command: redis-server --appendonly yes
+
+volumes:
+  redis_data:
+
+networks:
+  bot-network:
+    driver: bridge 
