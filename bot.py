@@ -43,7 +43,8 @@ from dotenv import load_dotenv
 from atproto import Client, models
 from atproto.exceptions import AtProtocolError
 import google.genai as genai
-from google.genai.types import Tool, GoogleSearch, GenerateVideosConfig
+from google.genai.types import Tool, GoogleSearch
+from google.genai import types
 import re # Import regular expressions
 from io import BytesIO # Need BytesIO if Gemini returns image bytes
 import base64
@@ -1412,12 +1413,29 @@ def generate_video_with_veo2(prompt: str, client: genai.Client) -> bytes | str |
         try:
             logging.info(f"🎬 Video generation attempt {attempt + 1}/{MAX_VIDEO_GENERATION_RETRIES}")
             
-            video_config = GenerateVideosConfig(
-                number_of_videos=1,
-                fps=24,
-                duration_seconds=8,
-                # person_generation=VIDEO_PERSON_GENERATION,  # Removing this parameter as it may not be supported
-            )
+            # Try to create video configuration with different parameter sets for compatibility
+            try:
+                video_config = genai.types.GenerateVideosConfig(
+                    number_of_videos=1,
+                    fps=24,
+                    duration_seconds=8,
+                    person_generation=VIDEO_PERSON_GENERATION,
+                )
+            except Exception as config_error:
+                logging.warning(f"Failed to create video config with fps parameter: {config_error}")
+                try:
+                    # Fallback to basic configuration
+                    video_config = genai.types.GenerateVideosConfig(
+                        number_of_videos=1,
+                        duration_seconds=8,
+                        person_generation=VIDEO_PERSON_GENERATION,
+                    )
+                except Exception as fallback_error:
+                    logging.error(f"Failed to create video config with basic parameters: {fallback_error}")
+                    # Last resort - use minimal configuration without person_generation
+                    video_config = genai.types.GenerateVideosConfig(
+                        number_of_videos=1,
+                    )
 
             operation = client.models.generate_videos(
                 model=VEO_MODEL_NAME,
