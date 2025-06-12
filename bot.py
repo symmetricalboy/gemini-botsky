@@ -162,6 +162,8 @@ BOT_SYSTEM_INSTRUCTION = f"""You are Gemini (@{BLUESKY_HANDLE}), a sophisticated
 *   **Developer Credit:** Only mention your developer, symmetricalboy (@symm.social), if a user specifically asks about your creation or development.
 """
 
+THREAD_DEPTH_LIMIT_MESSAGE = "Sorry, this thread has gotten very long! If you'd like to continue our conversation, please start a new thread."
+
 # Global variables
 bsky_client: Client | None = None
 genai_client: genai.Client | None = None
@@ -916,6 +918,26 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
         logging.debug(f"Current conversation thread length is {thread_length}.")
         if thread_length >= MAX_CONVERSATION_THREAD_DEPTH:
             logging.info(f"🔁 Thread too long ({thread_length}), sending limit message.")
+            
+            # Check if the parent message is already our canned thread depth limit message
+            post_record = target_post.record
+            if isinstance(post_record, at_models.AppBskyFeedPost.Record) and post_record.reply and post_record.reply.parent:
+                parent_ref = post_record.reply.parent
+                try:
+                    get_parent_params = GetPostsParams(uris=[parent_ref.uri])
+                    parent_post_response = bsky_client.app.bsky.feed.get_posts(params=get_parent_params)
+                    
+                    if parent_post_response and parent_post_response.posts and len(parent_post_response.posts) == 1:
+                        immediate_parent_post = parent_post_response.posts[0]
+                        
+                        # Check if parent is from our bot and contains the canned message
+                        if (immediate_parent_post.author.handle == BLUESKY_HANDLE and 
+                            THREAD_DEPTH_LIMIT_MESSAGE in immediate_parent_post.record.text):
+                            logging.info(f"🔄 Ignoring reply to our previous thread depth limit message.")
+                            return  # Stop processing this mention
+                except Exception as e:
+                    logging.error(f"Error checking parent post for thread depth limit: {e}")
+            
             try:
                 # We still need root/parent info to reply
                 canned_parent_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
@@ -927,7 +949,7 @@ def process_mention(notification: at_models.AppBskyNotificationListNotifications
                     canned_root_ref = canned_parent_ref
                 
                 bsky_client.send_post(
-                    text="Sorry, this thread has gotten very long! If you'd like to continue our conversation, please start a new thread.",
+                    text=THREAD_DEPTH_LIMIT_MESSAGE,
                     reply_to=at_models.AppBskyFeedPost.ReplyRef(root=canned_root_ref, parent=canned_parent_ref)
                 )
                 logging.info("✅ Sent thread depth limit message.")
@@ -2133,6 +2155,26 @@ def process_jetstream_event(event: dict, genai_client_ref: genai.Client):
         logging.debug(f"Current conversation thread length is {thread_length}.")
         if thread_length >= MAX_CONVERSATION_THREAD_DEPTH:
             logging.info(f"🔁 Thread too long ({thread_length}), sending limit message.")
+            
+            # Check if the parent message is already our canned thread depth limit message
+            post_record = target_post.record
+            if isinstance(post_record, at_models.AppBskyFeedPost.Record) and post_record.reply and post_record.reply.parent:
+                parent_ref = post_record.reply.parent
+                try:
+                    get_parent_params = GetPostsParams(uris=[parent_ref.uri])
+                    parent_post_response = bsky_client.app.bsky.feed.get_posts(params=get_parent_params)
+                    
+                    if parent_post_response and parent_post_response.posts and len(parent_post_response.posts) == 1:
+                        immediate_parent_post = parent_post_response.posts[0]
+                        
+                        # Check if parent is from our bot and contains the canned message
+                        if (immediate_parent_post.author.handle == BLUESKY_HANDLE and 
+                            THREAD_DEPTH_LIMIT_MESSAGE in immediate_parent_post.record.text):
+                            logging.info(f"🔄 Ignoring reply to our previous thread depth limit message.")
+                            return  # Stop processing this event
+                except Exception as e:
+                    logging.error(f"Error checking parent post for thread depth limit: {e}")
+            
             try:
                 canned_parent_ref = at_models.ComAtprotoRepoStrongRef.Main(cid=target_post.cid, uri=target_post.uri)
                 canned_root_ref = None
@@ -2143,7 +2185,7 @@ def process_jetstream_event(event: dict, genai_client_ref: genai.Client):
                     canned_root_ref = canned_parent_ref
                 
                 bsky_client.send_post(
-                    text="Sorry, this thread has gotten very long! If you'd like to continue our conversation, please start a new thread.",
+                    text=THREAD_DEPTH_LIMIT_MESSAGE,
                     reply_to=at_models.AppBskyFeedPost.ReplyRef(root=canned_root_ref, parent=canned_parent_ref)
                 )
                 logging.info("✅ Sent thread depth limit message.")
